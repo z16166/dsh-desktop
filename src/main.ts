@@ -29,8 +29,6 @@ const loading = q<HTMLDivElement>("#loading");
 const log = q<HTMLPreElement>("#log");
 const dot = q<HTMLSpanElement>("#status-dot");
 const statusText = q<HTMLSpanElement>("#status-text");
-const topbar = q<HTMLElement>("#topbar");
-const grabber = q<HTMLDivElement>("#grabber");
 const loadingSpinner = q<HTMLDivElement>("#loading-spinner");
 const loadingText = q<HTMLParagraphElement>("#loading-text");
 
@@ -39,7 +37,6 @@ type State = "starting" | "running" | "stopped" | "error";
 let upgrading = false;
 let cliMode = false;
 let ready = false;
-let hideTimer: number | undefined;
 
 function setStatus(state: State, text: string): void {
   dot.className = "dot " + state;
@@ -73,7 +70,6 @@ function showStartupError(message: string): void {
   ready = false;
   setStatus("error", "启动失败");
   setLoading(message, { error: true, retry: true });
-  showBar();
   appendLog("> " + message, "err");
   void closeDshWindow();
 }
@@ -82,22 +78,18 @@ async function dshWindow(): Promise<WebviewWindow | null> {
   return WebviewWindow.getByLabel(DSH_LABEL);
 }
 
-function dshTopInset(): number {
-  return topbar.classList.contains("visible") ? 52 : 8;
-}
-
 async function syncDshBounds(): Promise<void> {
   const wdw = await dshWindow();
   if (!wdw || cliMode || !ready) return;
   const main = getCurrentWindow();
   const scale = await main.scaleFactor();
   const origin = await main.innerPosition();
-  const size = await main.innerSize();
-  const top = dshTopInset();
-  const x = origin.x / scale;
-  const y = origin.y / scale + top;
-  const width = size.width / scale;
-  const height = Math.max(80, size.height / scale - top);
+  const frame = q<HTMLDivElement>("#app-frame");
+  const rect = frame.getBoundingClientRect();
+  const x = origin.x / scale + rect.left;
+  const y = origin.y / scale + rect.top;
+  const width = Math.max(80, rect.width);
+  const height = Math.max(80, rect.height);
   await wdw.setPosition(new LogicalPosition(x, y));
   await wdw.setSize(new LogicalSize(width, height));
 }
@@ -146,44 +138,6 @@ async function showApp(): Promise<void> {
     await wdw.show();
   }
   await syncDshBounds();
-}
-
-function showBar(): void {
-  if (hideTimer !== undefined) {
-    window.clearTimeout(hideTimer);
-    hideTimer = undefined;
-  }
-  topbar.classList.add("visible");
-  grabber.classList.add("hidden");
-  void syncDshBounds();
-}
-
-function scheduleHide(): void {
-  if (hideTimer !== undefined) window.clearTimeout(hideTimer);
-  hideTimer = window.setTimeout(() => {
-    topbar.classList.remove("visible");
-    grabber.classList.remove("hidden");
-    hideTimer = undefined;
-    void syncDshBounds();
-  }, 1500);
-}
-
-function setupBar(): void {
-  grabber.addEventListener("mouseenter", showBar);
-  grabber.addEventListener("click", showBar);
-  topbar.addEventListener("mouseenter", () => {
-    if (hideTimer !== undefined) {
-      window.clearTimeout(hideTimer);
-      hideTimer = undefined;
-    }
-  });
-  topbar.addEventListener("mouseleave", () => {
-    if (!cliMode) scheduleHide();
-  });
-  q("#bar-close").addEventListener("click", () => {
-    topbar.classList.remove("visible");
-    grabber.classList.remove("hidden");
-  });
 }
 
 function launchCommandLabel(): string {
@@ -291,11 +245,9 @@ function setupTabs(): void {
       Object.keys(panels).forEach((k) => panels[k].classList.toggle("active", k === key));
       if (key === "cli") {
         cliMode = true;
-        showBar();
         void hideDshWindow();
       } else {
         cliMode = false;
-        scheduleHide();
         if (ready) void showApp();
       }
     });
@@ -311,7 +263,6 @@ async function setupEvents(): Promise<void> {
     void showApp();
     appendLog("> 就绪：" + APP_URL, "sys");
     refreshDshVersion();
-    if (!cliMode) scheduleHide();
   });
   await listen("server:timeout", () => {
     showStartupError("启动超时：90 秒内未检测到端口监听，请检查 CLI 日志");
@@ -406,19 +357,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
   setupButtons();
   setupSourceControls();
-  setupBar();
   try {
     settings = await invoke<AppSettings>("get_settings");
   } catch {
     /* keep defaults */
   }
   syncSourceControls();
-  // The bar is visible at startup so users discover the controls,
-  // then auto-hides after 5s (or on mouseleave / × button).
-  showBar();
-  window.setTimeout(() => {
-    if (!cliMode) scheduleHide();
-  }, 5000);
   q("#version").textContent = "dsh …";
   const main = getCurrentWindow();
   await main.onResized(() => {

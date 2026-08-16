@@ -27,37 +27,17 @@ body {
 }
 
 .topbar {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
+  position: relative;
   z-index: 100;
   display: flex;
   align-items: center;
   gap: 16px;
   padding: 0 16px;
   height: 52px;
+  flex: 0 0 52px;
   background: var(--bg-2);
   border-bottom: 1px solid var(--border);
-  transform: translateY(-100%);
-  transition: transform 0.18s ease;
 }
-.topbar.visible { transform: translateY(0); }
-
-.grabber {
-  position: fixed;
-  top: 6px;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 56px;
-  height: 5px;
-  border-radius: 3px;
-  background: rgba(230, 233, 239, 0.35);
-  z-index: 101;
-  cursor: pointer;
-  transition: opacity 0.15s ease;
-}
-.grabber.hidden { opacity: 0; pointer-events: none; }
 
 .brand { display: flex; align-items: center; gap: 10px; }
 
@@ -99,7 +79,6 @@ main {
   display: none;
 }
 .panel.active { display: flex; flex-direction: column; }
-#panel-cli { padding-top: 52px; }
 
 /* App tab: webview fills the whole panel */
 .app-frame {
@@ -207,19 +186,6 @@ main {
   padding: 2px 9px;
   font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
 }
-
-/* topbar close button */
-.bar-close {
-  background: transparent;
-  border: none;
-  color: var(--muted);
-  font-size: 15px;
-  line-height: 1;
-  padding: 4px 9px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.bar-close:hover { color: var(--fg); background: var(--bg-3); }
 
 /* loading overlay states */
 .loading p.error-text { color: var(--red); font-weight: 600; }
