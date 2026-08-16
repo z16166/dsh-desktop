@@ -5,6 +5,18 @@ import { listen } from "@tauri-apps/api/event";
 const PORT = 3080;
 const APP_URL = "http://127.0.0.1:" + PORT;
 
+type LaunchSource = "npx" | "local";
+
+type AppSettings = {
+  source: LaunchSource;
+  localPath: string;
+};
+
+let settings: AppSettings = {
+  source: "local",
+  localPath: "H:\\github\\deepseek-harness",
+};
+
 function q<T extends HTMLElement>(sel: string): T {
   return document.querySelector(sel) as T;
 }
@@ -103,11 +115,25 @@ function setupBar(): void {
   });
 }
 
+function launchCommandLabel(): string {
+  return settings.source === "local"
+    ? "pnpm dsh web  (" + settings.localPath + ")"
+    : "npx @deepseek-ai/dsh web";
+}
+
+function syncSourceControls(): void {
+  const select = q<HTMLSelectElement>("#source-select");
+  const path = q<HTMLInputElement>("#local-path");
+  select.value = settings.source;
+  path.value = settings.localPath;
+  path.hidden = settings.source !== "local";
+}
+
 async function start(): Promise<void> {
   ready = false;
   setStatus("starting", "启动中…");
-  setLoading("正在启动 npx @deepseek-ai/dsh web …");
-  appendLog("$ npx @deepseek-ai/dsh web", "sys");
+  setLoading("正在启动 " + launchCommandLabel() + " …");
+  appendLog("$ " + launchCommandLabel(), "sys");
   try {
     const s = await invoke<any>("start_server");
     appendLog("> 等待端口 " + s.port + " 就绪…", "sys");
@@ -137,7 +163,14 @@ async function upgrade(): Promise<void> {
   upgrading = true;
   const btn = q<HTMLButtonElement>("#btn-upgrade");
   btn.disabled = true;
-  appendLog("> 正在检查最新版本并安装…", "sys");
+  q<HTMLSelectElement>("#source-select").disabled = true;
+  q<HTMLInputElement>("#local-path").disabled = true;
+  appendLog(
+    settings.source === "local"
+      ? "> 正在从本地仓库升级（git pull → pnpm install → pnpm run build）…"
+      : "> 正在检查最新版本并安装…",
+    "sys",
+  );
   try {
     const r = await invoke<any>("upgrade_dsh");
     if (r.ok) {
@@ -154,6 +187,8 @@ async function upgrade(): Promise<void> {
   } finally {
     upgrading = false;
     btn.disabled = false;
+    q<HTMLSelectElement>("#source-select").disabled = false;
+    q<HTMLInputElement>("#local-path").disabled = false;
   }
 }
 
@@ -223,6 +258,53 @@ async function setupEvents(): Promise<void> {
   await listen<string>("upgrade:stderr", (e2) => appendLog(e2.payload, "err"));
 }
 
+async function persistSettings(next: AppSettings, restartAfter: boolean): Promise<boolean> {
+  try {
+    settings = await invoke<AppSettings>("set_settings", { settings: next });
+    syncSourceControls();
+    appendLog(
+      "> 启动源已设为 " +
+        (settings.source === "local" ? "本地源码 · " + settings.localPath : "npx"),
+      "sys",
+    );
+    if (restartAfter) await restart();
+    return true;
+  } catch (e) {
+    appendLog("> 保存启动源失败：" + String(e), "err");
+    syncSourceControls();
+    return false;
+  }
+}
+
+function setupSourceControls(): void {
+  const select = q<HTMLSelectElement>("#source-select");
+  const path = q<HTMLInputElement>("#local-path");
+  select.addEventListener("change", async () => {
+    if (upgrading) {
+      syncSourceControls();
+      return;
+    }
+    const next: AppSettings = {
+      source: select.value === "local" ? "local" : "npx",
+      localPath: path.value.trim() || settings.localPath,
+    };
+    await persistSettings(next, true);
+  });
+  const applyPath = async () => {
+    if (upgrading || settings.source !== "local") return;
+    const localPath = path.value.trim();
+    if (!localPath || localPath === settings.localPath) return;
+    await persistSettings({ source: "local", localPath }, true);
+  };
+  path.addEventListener("change", applyPath);
+  path.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void applyPath();
+    }
+  });
+}
+
 function setupButtons(): void {
   q("#btn-start").addEventListener("click", start);
   q("#btn-stop").addEventListener("click", stop);
@@ -238,7 +320,8 @@ async function refreshDshVersion(): Promise<void> {
   const el = q<HTMLSpanElement>("#version");
   try {
     const v = await invoke<string>("dsh_version");
-    el.textContent = v && v !== "unknown" ? "dsh v" + v : "dsh 未知";
+    const suffix = settings.source === "local" ? " · 本地" : "";
+    el.textContent = v && v !== "unknown" ? "dsh v" + v + suffix : "dsh 未知";
   } catch {
     el.textContent = "dsh 未知";
   }
@@ -247,7 +330,14 @@ async function refreshDshVersion(): Promise<void> {
 window.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
   setupButtons();
+  setupSourceControls();
   setupBar();
+  try {
+    settings = await invoke<AppSettings>("get_settings");
+  } catch {
+    /* keep defaults */
+  }
+  syncSourceControls();
   // The bar is visible at startup so users discover the controls,
   // then auto-hides after 5s (or on mouseleave / × button).
   showBar();

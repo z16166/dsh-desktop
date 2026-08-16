@@ -161,6 +161,29 @@ main {
   font-size: 13px;
 }
 .cli-toolbar button:hover { border-color: var(--accent); }
+.cli-toolbar select,
+.cli-toolbar input[type="text"] {
+  background: var(--bg-3);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+}
+.cli-toolbar select { cursor: pointer; }
+.cli-toolbar select:hover,
+.cli-toolbar input[type="text"]:hover,
+.cli-toolbar input[type="text"]:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+#local-path {
+  flex: 1 1 220px;
+  min-width: 160px;
+  max-width: 420px;
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
 .spacer { flex: 1; }
 
 .log {

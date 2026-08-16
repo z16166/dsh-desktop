@@ -30,7 +30,7 @@
         <div class="app-frame">
           <div class="loading" id="loading">
             <div class="spinner" id="loading-spinner"></div>
-            <p id="loading-text">正在启动 npx @deepseek-ai/dsh web …</p>
+            <p id="loading-text">正在启动 DeepSeek Harness …</p>
             <p class="hint" id="loading-hint" hidden>可在上方 CLI 页签查看详细日志，安装好依赖后可重试。</p>
             <button class="retry-btn" id="btn-retry" hidden>重试启动</button>
           </div>
@@ -44,6 +44,11 @@
           <button id="btn-stop">停止</button>
           <button id="btn-restart">重启</button>
           <button id="btn-upgrade">升级</button>
+          <select id="source-select" title="启动源">
+            <option value="local">本地源码</option>
+            <option value="npx">npx</option>
+          </select>
+          <input id="local-path" type="text" spellcheck="false" placeholder="本地仓库路径" hidden />
           <span class="spacer"></span>
           <button id="btn-clear">清空</button>
           <button id="btn-copy">复制</button>
