@@ -282,6 +282,9 @@ async function setupEvents(): Promise<void> {
   });
   await listen<string>("upgrade:stdout", (e2) => appendLog(e2.payload, "out"));
   await listen<string>("upgrade:stderr", (e2) => appendLog(e2.payload, "err"));
+  await listen("app:restore", () => {
+    if (ready && !cliMode) void showApp();
+  });
 }
 
 async function persistSettings(next: AppSettings, restartAfter: boolean): Promise<boolean> {
