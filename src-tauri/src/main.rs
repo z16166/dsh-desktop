@@ -892,13 +892,51 @@ fn sync_dsh_theme(app: AppHandle) {
 
 const INJECT_WIDE_CHAT_JS: &str = r#"
 (() => {
-  const id = "dsh-desktop-wide-chat";
-  if (!document.getElementById(id)) {
+  const head = document.head || document.documentElement;
+  const wideId = "dsh-desktop-wide-chat";
+  if (!document.getElementById(wideId)) {
     const style = document.createElement("style");
-    style.id = id;
+    style.id = wideId;
     style.textContent = "html.dsh-desktop-wide-chat,html.dsh-desktop-wide-chat *{--dsh-chat-content-width:100%!important;--dsh-composer-card-max-width:100%!important;}";
     document.documentElement.classList.add("dsh-desktop-wide-chat");
-    (document.head || document.documentElement).appendChild(style);
+    head.appendChild(style);
+  }
+
+  const fontId = "dsh-desktop-lxgw-font";
+  if (!document.getElementById(fontId)) {
+    const names = [
+      "霞鹜文楷等宽 GB 屏幕阅读版",
+      "LXGW WenKai Mono GB Screen",
+    ];
+    const pick = (candidates) => {
+      const ctx = document.createElement("canvas").getContext("2d");
+      if (!ctx) return null;
+      const sample = "mmmmmmmmlli汉字國國";
+      for (const name of candidates) {
+        for (const base of ["monospace", "serif", "sans-serif"]) {
+          ctx.font = "72px " + base;
+          const fallback = ctx.measureText(sample).width;
+          ctx.font = '72px "' + name + '", ' + base;
+          if (ctx.measureText(sample).width !== fallback) return name;
+        }
+      }
+      return null;
+    };
+    const name = pick(names);
+    if (name) {
+      const style = document.createElement("style");
+      style.id = fontId;
+      const quoted = '"' + name + '"';
+      style.textContent =
+        "html.dsh-desktop-lxgw,html.dsh-desktop-lxgw body,html.dsh-desktop-lxgw *:not(svg):not(path){font-family:" +
+        quoted +
+        ",monospace!important;}" +
+        "html.dsh-desktop-lxgw{--dsw-font-family:" +
+        quoted +
+        ",monospace!important;}";
+      document.documentElement.classList.add("dsh-desktop-lxgw");
+      head.appendChild(style);
+    }
   }
   return true;
 })()
