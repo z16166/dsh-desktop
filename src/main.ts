@@ -1,6 +1,6 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -38,9 +38,28 @@ const topbar = q<HTMLElement>("#topbar");
 
 type State = "starting" | "running" | "stopped" | "error";
 
+type DshTheme = {
+  dark: boolean;
+  bg: string;
+  fg: string;
+  border: string;
+};
+
 let upgrading = false;
 let cliMode = false;
 let ready = false;
+let lastDshTheme: DshTheme | null = null;
+let themeTimer: number | undefined;
+
+function startThemeSync(): void {
+  const tick = () => {
+    void invoke("sync_dsh_theme");
+  };
+  tick();
+  if (themeTimer === undefined) {
+    themeTimer = window.setInterval(tick, 1500);
+  }
+}
 
 function setStatus(state: State, text: string): void {
   dot.className = "dot " + state;
@@ -83,29 +102,36 @@ function chromeOpen(): boolean {
   return topbar.classList.contains("open");
 }
 
-function relayoutOverlays(): void {
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => {
-      void syncOverlayBounds();
-    });
-  });
+let overlayOp: Promise<void> = Promise.resolve();
+
+function runOverlayOp(fn: () => Promise<void>): Promise<void> {
+  const next = overlayOp.then(fn, fn);
+  overlayOp = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
 }
 
 function showChrome(): void {
   if (!chromeOpen()) {
     topbar.classList.add("open");
-    relayoutOverlays();
   }
-  void hideChromeBtn();
+  void (async () => {
+    await syncDshBounds();
+    await hideChromeBtn();
+  })();
 }
 
 function hideChrome(): void {
   if (cliMode) return;
   if (chromeOpen()) {
     topbar.classList.remove("open");
-    relayoutOverlays();
   }
-  void raiseChromeBtn();
+  void (async () => {
+    await syncDshBounds();
+    await raiseChromeBtn();
+  })();
 }
 
 function setupChrome(): void {
@@ -200,8 +226,10 @@ async function raiseChromeBtn(): Promise<void> {
   try {
     const wdw = await ensureChromeBtn();
     await syncChromeBtnBounds();
-    await wdw.hide();
     await wdw.show();
+    await invoke("raise_overlay", { label: CHROME_BTN_LABEL });
+    startThemeSync();
+    if (lastDshTheme) void emit("dsh:theme", lastDshTheme);
   } catch (e) {
     appendLog("> 无法显示工具栏按钮：" + String(e), "err");
   }
@@ -252,7 +280,8 @@ async function showApp(): Promise<void> {
     await wdw.show();
   }
   await syncDshBounds();
-  await raiseChromeBtn();
+  startThemeSync();
+  await runOverlayOp(() => raiseChromeBtn());
 }
 
 function launchCommandLabel(): string {
@@ -362,9 +391,9 @@ function setupTabs(): void {
         cliMode = true;
         showChrome();
         void hideDshWindow();
+        void runOverlayOp(() => hideChromeBtn());
       } else {
         cliMode = false;
-        hideChrome();
         if (ready) void showApp();
       }
     });
@@ -377,10 +406,12 @@ async function setupEvents(): Promise<void> {
   await listen("server:ready", () => {
     ready = true;
     setStatus("running", "运行中 · " + APP_URL);
-    void showApp();
+    void (async () => {
+      await showApp();
+      if (!cliMode) hideChrome();
+    })();
     appendLog("> 就绪：" + APP_URL, "sys");
     refreshDshVersion();
-    if (!cliMode) hideChrome();
   });
   await listen("server:timeout", () => {
     showStartupError("启动超时：90 秒内未检测到端口监听，请检查 CLI 日志");
@@ -405,6 +436,12 @@ async function setupEvents(): Promise<void> {
   });
   await listen("chrome:show", () => {
     showChrome();
+  });
+  await listen<DshTheme>("dsh:theme", (e) => {
+    lastDshTheme = e.payload;
+  });
+  await listen("dsh:theme-request", () => {
+    if (lastDshTheme) void emit("dsh:theme", lastDshTheme);
   });
 }
 

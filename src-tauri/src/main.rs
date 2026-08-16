@@ -814,6 +814,107 @@ fn server_status(app: AppHandle) -> Status {
     status_of(&app, running)
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct DshTheme {
+    dark: bool,
+    bg: String,
+    fg: String,
+    border: String,
+}
+
+const READ_DSH_THEME_JS: &str = r#"
+(() => {
+  try {
+    const body = document.body;
+    if (!body) return null;
+    const cs = getComputedStyle(body);
+    const token = (name) => (cs.getPropertyValue(name) || "").trim();
+    const bg = token("--dsw-alias-button-floating-fill")
+      || token("--dsw-alias-bg-layer-2")
+      || token("--dsw-specific-sidebar-fill")
+      || cs.backgroundColor;
+    const fg = token("--dsw-alias-label-primary") || cs.color;
+    const border = token("--dsw-alias-border-l2")
+      || token("--dsw-alias-border-l1")
+      || "transparent";
+    const dark = body.hasAttribute("data-ds-dark-theme")
+      || document.documentElement.style.colorScheme === "dark";
+    return { dark, bg, fg, border };
+  } catch (e) {
+    return null;
+  }
+})()
+"#;
+
+/// Read live theme tokens from the Harness page and broadcast them.
+#[tauri::command]
+fn sync_dsh_theme(app: AppHandle) {
+    let Some(wdw) = app.get_webview_window("dsh") else {
+        return;
+    };
+    let app = app.clone();
+    let _ = wdw.eval_with_callback(READ_DSH_THEME_JS, move |json| {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+            return;
+        };
+        if value.is_null() {
+            return;
+        }
+        let Ok(theme) = serde_json::from_value::<DshTheme>(value) else {
+            return;
+        };
+        if theme.bg.is_empty() {
+            return;
+        }
+        let _ = app.emit("dsh:theme", theme);
+    });
+}
+
+#[cfg(windows)]
+fn raise_win32(wdw: &tauri::WebviewWindow) {
+    let Ok(hwnd) = wdw.hwnd() else {
+        return;
+    };
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowPos(
+            hwnd: isize,
+            insert_after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> i32;
+    }
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    unsafe {
+        SetWindowPos(
+            hwnd.0 as isize,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
+/// Show `label` above sibling webviews (dsh) without recreating it.
+#[tauri::command]
+fn raise_overlay(app: AppHandle, label: String) {
+    let Some(wdw) = app.get_webview_window(&label) else {
+        return;
+    };
+    let _ = wdw.show();
+    #[cfg(windows)]
+    raise_win32(&wdw);
+}
+
 fn hide_to_tray(app: &AppHandle) {
     for label in ["dsh", "chrome-btn"] {
         if let Some(wdw) = app.get_webview_window(label) {
@@ -876,7 +977,9 @@ fn main() {
             restart_server,
             server_status,
             upgrade_dsh,
-            dsh_version
+            dsh_version,
+            sync_dsh_theme,
+            raise_overlay
         ])
         .setup(|app| setup_tray(app))
         .on_window_event(|window, event| {
