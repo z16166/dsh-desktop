@@ -27,6 +27,9 @@ body {
 }
 
 .topbar {
+  display: none;
+}
+.topbar.open {
   position: relative;
   z-index: 100;
   display: flex;
@@ -186,6 +189,18 @@ main {
   padding: 2px 9px;
   font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
 }
+
+.bar-close {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  padding: 4px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.bar-close:hover { color: var(--fg); background: var(--bg-3); }
 
 /* loading overlay states */
 .loading p.error-text { color: var(--red); font-weight: 600; }

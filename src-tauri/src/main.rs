@@ -815,8 +815,10 @@ fn server_status(app: AppHandle) -> Status {
 }
 
 fn hide_to_tray(app: &AppHandle) {
-    if let Some(dsh) = app.get_webview_window("dsh") {
-        let _ = dsh.hide();
+    for label in ["dsh", "chrome-btn"] {
+        if let Some(wdw) = app.get_webview_window(label) {
+            let _ = wdw.hide();
+        }
     }
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
@@ -882,6 +884,8 @@ fn main() {
                 if window.label() == "main" {
                     api.prevent_close();
                     hide_to_tray(window.app_handle());
+                } else if window.label() == "chrome-btn" {
+                    api.prevent_close();
                 }
             }
         })

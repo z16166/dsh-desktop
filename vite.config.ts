@@ -1,4 +1,8 @@
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
+
+const root = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig({
   clearScreen: false,
@@ -11,5 +15,11 @@ export default defineConfig({
     target: process.env.TAURI_ENV_PLATFORM === "windows" ? "chrome105" : "safari13",
     minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
+    rollupOptions: {
+      input: {
+        main: resolve(root, "index.html"),
+        "chrome-btn": resolve(root, "chrome-btn.html"),
+      },
+    },
   },
 });

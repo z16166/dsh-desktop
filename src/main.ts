@@ -25,12 +25,16 @@ function q<T extends HTMLElement>(sel: string): T {
 }
 
 const DSH_LABEL = "dsh";
+const CHROME_BTN_LABEL = "chrome-btn";
+const CHROME_BTN_SIZE = 36;
+const CHROME_BTN_MARGIN = 12;
 const loading = q<HTMLDivElement>("#loading");
 const log = q<HTMLPreElement>("#log");
 const dot = q<HTMLSpanElement>("#status-dot");
 const statusText = q<HTMLSpanElement>("#status-text");
 const loadingSpinner = q<HTMLDivElement>("#loading-spinner");
 const loadingText = q<HTMLParagraphElement>("#loading-text");
+const topbar = q<HTMLElement>("#topbar");
 
 type State = "starting" | "running" | "stopped" | "error";
 
@@ -70,8 +74,44 @@ function showStartupError(message: string): void {
   ready = false;
   setStatus("error", "启动失败");
   setLoading(message, { error: true, retry: true });
+  showChrome();
   appendLog("> " + message, "err");
   void closeDshWindow();
+}
+
+function chromeOpen(): boolean {
+  return topbar.classList.contains("open");
+}
+
+function relayoutOverlays(): void {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      void syncOverlayBounds();
+    });
+  });
+}
+
+function showChrome(): void {
+  if (!chromeOpen()) {
+    topbar.classList.add("open");
+    relayoutOverlays();
+  }
+  void hideChromeBtn();
+}
+
+function hideChrome(): void {
+  if (cliMode) return;
+  if (chromeOpen()) {
+    topbar.classList.remove("open");
+    relayoutOverlays();
+  }
+  void raiseChromeBtn();
+}
+
+function setupChrome(): void {
+  q("#bar-close").addEventListener("click", () => {
+    hideChrome();
+  });
 }
 
 async function dshWindow(): Promise<WebviewWindow | null> {
@@ -94,6 +134,79 @@ async function syncDshBounds(): Promise<void> {
   await wdw.setSize(new LogicalSize(width, height));
 }
 
+async function syncOverlayBounds(): Promise<void> {
+  await syncDshBounds();
+  await syncChromeBtnBounds();
+}
+
+async function chromeBtnWindow(): Promise<WebviewWindow | null> {
+  return WebviewWindow.getByLabel(CHROME_BTN_LABEL);
+}
+
+async function ensureChromeBtn(): Promise<WebviewWindow> {
+  let wdw = await chromeBtnWindow();
+  if (wdw) return wdw;
+  const main = getCurrentWindow();
+  wdw = new WebviewWindow(CHROME_BTN_LABEL, {
+    url: "chrome-btn.html",
+    parent: main,
+    decorations: false,
+    skipTaskbar: true,
+    resizable: false,
+    shadow: false,
+    focus: false,
+    visible: false,
+    width: CHROME_BTN_SIZE,
+    height: CHROME_BTN_SIZE,
+  });
+  await new Promise<void>((resolve, reject) => {
+    const t = window.setTimeout(() => reject(new Error("创建工具栏按钮超时")), 8000);
+    wdw!.once("tauri://created", () => {
+      window.clearTimeout(t);
+      resolve();
+    });
+    wdw!.once("tauri://error", (e) => {
+      window.clearTimeout(t);
+      reject(e.payload ?? e);
+    });
+  });
+  return wdw;
+}
+
+async function syncChromeBtnBounds(): Promise<void> {
+  const wdw = await chromeBtnWindow();
+  if (!wdw) return;
+  const main = getCurrentWindow();
+  const scale = await main.scaleFactor();
+  const origin = await main.innerPosition();
+  const frame = q<HTMLDivElement>("#app-frame");
+  const rect = frame.getBoundingClientRect();
+  const x = origin.x / scale + rect.left + rect.width - CHROME_BTN_SIZE - CHROME_BTN_MARGIN;
+  const y = origin.y / scale + rect.top + CHROME_BTN_MARGIN;
+  await wdw.setPosition(new LogicalPosition(x, y));
+  await wdw.setSize(new LogicalSize(CHROME_BTN_SIZE, CHROME_BTN_SIZE));
+}
+
+async function hideChromeBtn(): Promise<void> {
+  const wdw = await chromeBtnWindow();
+  if (wdw) await wdw.hide();
+}
+
+async function raiseChromeBtn(): Promise<void> {
+  if (cliMode || chromeOpen()) {
+    await hideChromeBtn();
+    return;
+  }
+  try {
+    const wdw = await ensureChromeBtn();
+    await syncChromeBtnBounds();
+    await wdw.hide();
+    await wdw.show();
+  } catch (e) {
+    appendLog("> 无法显示工具栏按钮：" + String(e), "err");
+  }
+}
+
 async function hideDshWindow(): Promise<void> {
   const wdw = await dshWindow();
   if (wdw) await wdw.hide();
@@ -108,6 +221,7 @@ async function showApp(): Promise<void> {
   loading.style.display = "none";
   if (cliMode) {
     await hideDshWindow();
+    await hideChromeBtn();
     return;
   }
   let wdw = await dshWindow();
@@ -138,6 +252,7 @@ async function showApp(): Promise<void> {
     await wdw.show();
   }
   await syncDshBounds();
+  await raiseChromeBtn();
 }
 
 function launchCommandLabel(): string {
@@ -245,9 +360,11 @@ function setupTabs(): void {
       Object.keys(panels).forEach((k) => panels[k].classList.toggle("active", k === key));
       if (key === "cli") {
         cliMode = true;
+        showChrome();
         void hideDshWindow();
       } else {
         cliMode = false;
+        hideChrome();
         if (ready) void showApp();
       }
     });
@@ -263,6 +380,7 @@ async function setupEvents(): Promise<void> {
     void showApp();
     appendLog("> 就绪：" + APP_URL, "sys");
     refreshDshVersion();
+    if (!cliMode) hideChrome();
   });
   await listen("server:timeout", () => {
     showStartupError("启动超时：90 秒内未检测到端口监听，请检查 CLI 日志");
@@ -284,6 +402,9 @@ async function setupEvents(): Promise<void> {
   await listen<string>("upgrade:stderr", (e2) => appendLog(e2.payload, "err"));
   await listen("app:restore", () => {
     if (ready && !cliMode) void showApp();
+  });
+  await listen("chrome:show", () => {
+    showChrome();
   });
 }
 
@@ -360,6 +481,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupTabs();
   setupButtons();
   setupSourceControls();
+  setupChrome();
   try {
     settings = await invoke<AppSettings>("get_settings");
   } catch {
@@ -369,10 +491,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   q("#version").textContent = "dsh …";
   const main = getCurrentWindow();
   await main.onResized(() => {
-    void syncDshBounds();
+    void syncOverlayBounds();
   });
   await main.onMoved(() => {
-    void syncDshBounds();
+    void syncOverlayBounds();
   });
   await setupEvents();
   try {

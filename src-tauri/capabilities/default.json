@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main", "dsh"],
+  "windows": ["main", "dsh", "chrome-btn"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",

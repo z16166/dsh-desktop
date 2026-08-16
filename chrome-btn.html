@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #161a22;
+      }
+      button {
+        width: 100%;
+        height: 100%;
+        border: 1px solid #2a3140;
+        background: #161a22;
+        color: #e6e9ef;
+        cursor: pointer;
+        font-size: 16px;
+        line-height: 1;
+        padding: 0;
+      }
+      button:hover { border-color: #4c8dff; }
+    </style>
+  </head>
+  <body>
+    <button type="button" id="btn" title="显示工具栏">☰</button>
+    <script type="module" src="/src/chrome-btn.ts"></script>
+  </body>
+</html>
