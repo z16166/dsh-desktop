@@ -28,6 +28,7 @@ const DSH_LABEL = "dsh";
 const CHROME_BTN_LABEL = "chrome-btn";
 const CHROME_BTN_SIZE = 36;
 const CHROME_BTN_MARGIN = 12;
+const CHROME_BTN_GAP = 8;
 const loading = q<HTMLDivElement>("#loading");
 const log = q<HTMLPreElement>("#log");
 const dot = q<HTMLSpanElement>("#status-dot");
@@ -38,11 +39,19 @@ const topbar = q<HTMLElement>("#topbar");
 
 type State = "starting" | "running" | "stopped" | "error";
 
+type DshAvoidRect = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
 type DshTheme = {
   dark: boolean;
   bg: string;
   fg: string;
   border: string;
+  avoid?: DshAvoidRect | null;
 };
 
 let upgrading = false;
@@ -50,10 +59,15 @@ let cliMode = false;
 let ready = false;
 let lastDshTheme: DshTheme | null = null;
 let themeTimer: number | undefined;
+let dshFocusBound = false;
 
 function startThemeSync(): void {
   const tick = () => {
     void invoke("sync_dsh_theme");
+    if (!cliMode && !chromeOpen()) {
+      void invoke("raise_overlay", { label: CHROME_BTN_LABEL });
+      void syncChromeBtnBounds();
+    }
   };
   tick();
   if (themeTimer === undefined) {
@@ -207,8 +221,21 @@ async function syncChromeBtnBounds(): Promise<void> {
   const origin = await main.innerPosition();
   const frame = q<HTMLDivElement>("#app-frame");
   const rect = frame.getBoundingClientRect();
-  const x = origin.x / scale + rect.left + rect.width - CHROME_BTN_SIZE - CHROME_BTN_MARGIN;
-  const y = origin.y / scale + rect.top + CHROME_BTN_MARGIN;
+  const baseX = origin.x / scale + rect.left;
+  const baseY = origin.y / scale + rect.top;
+  let x = baseX + rect.width - CHROME_BTN_SIZE - CHROME_BTN_MARGIN;
+  let y = baseY + CHROME_BTN_MARGIN;
+  const avoid = lastDshTheme?.avoid;
+  if (avoid && avoid.w > 0 && avoid.h > 0) {
+    x = baseX + avoid.x - CHROME_BTN_GAP - CHROME_BTN_SIZE;
+    y = baseY + avoid.y + (avoid.h - CHROME_BTN_SIZE) / 2;
+  }
+  const minX = baseX + 4;
+  const maxX = baseX + rect.width - CHROME_BTN_SIZE - 4;
+  const minY = baseY + 4;
+  const maxY = baseY + rect.height - CHROME_BTN_SIZE - 4;
+  x = Math.min(maxX, Math.max(minX, x));
+  y = Math.min(maxY, Math.max(minY, y));
   await wdw.setPosition(new LogicalPosition(x, y));
   await wdw.setSize(new LogicalSize(CHROME_BTN_SIZE, CHROME_BTN_SIZE));
 }
@@ -241,6 +268,7 @@ async function hideDshWindow(): Promise<void> {
 }
 
 async function closeDshWindow(): Promise<void> {
+  dshFocusBound = false;
   const wdw = await dshWindow();
   if (wdw) await wdw.close();
 }
@@ -278,6 +306,12 @@ async function showApp(): Promise<void> {
     appendLog("> 已用独立窗口加载 Web UI（避免 iframe 跨站拦截插件）", "sys");
   } else {
     await wdw.show();
+  }
+  if (!dshFocusBound) {
+    dshFocusBound = true;
+    await wdw.onFocusChanged(({ payload: focused }) => {
+      if (focused && !cliMode && !chromeOpen()) void raiseChromeBtn();
+    });
   }
   await syncDshBounds();
   startThemeSync();
@@ -439,6 +473,7 @@ async function setupEvents(): Promise<void> {
   });
   await listen<DshTheme>("dsh:theme", (e) => {
     lastDshTheme = e.payload;
+    if (!cliMode && !chromeOpen()) void syncChromeBtnBounds();
   });
   await listen("dsh:theme-request", () => {
     if (lastDshTheme) void emit("dsh:theme", lastDshTheme);

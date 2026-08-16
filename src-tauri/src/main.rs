@@ -815,11 +815,21 @@ fn server_status(app: AppHandle) -> Status {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct DshAvoidRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct DshTheme {
     dark: bool,
     bg: String,
     fg: String,
     border: String,
+    #[serde(default)]
+    avoid: Option<DshAvoidRect>,
 }
 
 const READ_DSH_THEME_JS: &str = r#"
@@ -839,7 +849,17 @@ const READ_DSH_THEME_JS: &str = r#"
       || "transparent";
     const dark = body.hasAttribute("data-ds-dark-theme")
       || document.documentElement.style.colorScheme === "dark";
-    return { dark, bg, fg, border };
+    const sessionLog = Array.from(document.querySelectorAll("button")).find((b) =>
+      (b.textContent || "").includes("Session log")
+    );
+    let avoid = null;
+    if (sessionLog) {
+      const r = sessionLog.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        avoid = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    return { dark, bg, fg, border, avoid };
   } catch (e) {
     return null;
   }
