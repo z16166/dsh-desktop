@@ -127,6 +127,163 @@ fn validate_local_repo(path: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn path_sep() -> char {
+    if cfg!(windows) { ';' } else { ':' }
+}
+
+/// Directories a GUI-launched process often lacks on PATH.
+fn extra_tool_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Ok(base) = std::env::var(var) {
+                let candidate = if var == "LOCALAPPDATA" {
+                    PathBuf::from(format!("{base}\\Programs\\nodejs"))
+                } else {
+                    PathBuf::from(format!("{base}\\nodejs"))
+                };
+                if candidate.is_dir() {
+                    dirs.push(candidate);
+                }
+            }
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let npm = PathBuf::from(format!("{appdata}\\npm"));
+            if npm.is_dir() {
+                dirs.push(npm);
+            }
+            let nvm = PathBuf::from(format!("{appdata}\\nvm"));
+            if nvm.is_dir() {
+                dirs.push(nvm);
+            }
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            for rel in [r"pnpm", r"Volta\bin", r"fnm"] {
+                let p = PathBuf::from(format!("{local}\\{rel}"));
+                if p.is_dir() {
+                    dirs.push(p);
+                }
+            }
+        }
+        for git in [r"C:\Program Files\Git\cmd", r"C:\Program Files (x86)\Git\cmd"] {
+            let p = PathBuf::from(git);
+            if p.is_dir() {
+                dirs.push(p);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        for p in [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/opt/fnm/bin",
+            "/usr/local/bin",
+        ] {
+            let path = PathBuf::from(p);
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs
+}
+
+fn apply_child_path(c: &mut Command, extra: &[PathBuf]) {
+    let mut dirs: Vec<String> = extra
+        .iter()
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    for p in extra_tool_dirs() {
+        let s = p.to_string_lossy().into_owned();
+        if !dirs.iter().any(|d| d == &s) {
+            dirs.push(s);
+        }
+    }
+    if dirs.is_empty() {
+        return;
+    }
+    let sep = path_sep();
+    let mut path = dirs.join(&sep.to_string());
+    if let Ok(p) = std::env::var("PATH") {
+        if !p.is_empty() {
+            path.push(sep);
+            path.push_str(&p);
+        }
+    }
+    c.env("PATH", path);
+}
+
+fn find_in_dirs(name: &str, extra: &[PathBuf]) -> Option<PathBuf> {
+    let mut dirs = extra.to_vec();
+    dirs.extend(extra_tool_dirs());
+    if let Ok(path) = std::env::var("PATH") {
+        for part in path.split(path_sep()) {
+            if !part.is_empty() {
+                dirs.push(PathBuf::from(part));
+            }
+        }
+    }
+    let candidates = if cfg!(windows) {
+        vec![
+            format!("{name}.exe"),
+            format!("{name}.cmd"),
+            name.to_string(),
+        ]
+    } else {
+        vec![name.to_string()]
+    };
+    for dir in dirs {
+        for file in &candidates {
+            let p = dir.join(file);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+fn find_node() -> Result<PathBuf, String> {
+    find_in_dirs("node", &[])
+        .filter(|p| match p.extension().and_then(|e| e.to_str()) {
+            Some(ext) => !ext.eq_ignore_ascii_case("cmd"),
+            None => true,
+        })
+        .ok_or_else(|| {
+            "找不到 node。从资源管理器启动时 PATH 往往没有 Node.js，请安装 Node.js 22+".to_string()
+        })
+}
+
+fn local_source_bin(dir: &Path) -> PathBuf {
+    dir.join("apps").join("cli").join("src").join("bin.ts")
+}
+
+/// Official source vector: `node --import tsx/esm apps/cli/src/bin.ts`.
+/// Does not go through `pnpm`, so it still works when this exe is launched
+/// from `target/release` (or anywhere else) rather than a repo root.
+fn local_dsh_command(dir: &Path, extra_args: &[&str]) -> Result<Command, String> {
+    let node = find_node()?;
+    let bin = local_source_bin(dir);
+    if !bin.is_file() {
+        return Err(format!("找不到源码入口：{}", bin.display()));
+    }
+    let mut extras = Vec::new();
+    if let Some(parent) = node.parent() {
+        extras.push(parent.to_path_buf());
+    }
+    extras.push(dir.join("node_modules").join(".bin"));
+    let mut c = Command::new(&node);
+    c.arg("--import").arg("tsx/esm").arg(&bin);
+    c.args(extra_args);
+    c.current_dir(dir);
+    apply_child_path(&mut c, &extras);
+    #[cfg(windows)]
+    hide_console(&mut c);
+    Ok(c)
+}
+
 /// Base tool launcher for non-Windows (macOS/Linux). Prefers an explicit
 /// fnm path so the app also works when launched from Finder/Dock, where the
 /// GUI process has a minimal PATH without node/npx/pnpm; falls back to PATH.
@@ -143,7 +300,9 @@ fn base_tool_cmd(tool: &str) -> Command {
             return c;
         }
     }
-    Command::new(tool)
+    let mut c = Command::new(tool);
+    apply_child_path(&mut c, &[]);
+    c
 }
 
 /// Windows: keep the child console hidden so no cmd window flashes up.
@@ -162,54 +321,9 @@ fn hide_console(c: &mut Command) {
 fn base_tool_cmd(tool: &str) -> Command {
     let mut c = Command::new("cmd");
     c.args(["/C", tool]);
-    augment_path_for_tools(&mut c);
+    apply_child_path(&mut c, &[]);
     hide_console(&mut c);
     c
-}
-
-#[cfg(windows)]
-fn augment_path_for_tools(c: &mut Command) {
-    let mut dirs: Vec<String> = Vec::new();
-    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
-        if let Ok(base) = std::env::var(var) {
-            let candidate = if var == "LOCALAPPDATA" {
-                format!("{base}\\Programs\\nodejs")
-            } else {
-                format!("{base}\\nodejs")
-            };
-            if Path::new(&candidate).is_dir() {
-                dirs.push(candidate);
-            }
-        }
-    }
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let npm = format!("{appdata}\\npm");
-        if Path::new(&npm).is_dir() {
-            dirs.push(npm);
-        }
-    }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let pnpm = format!("{local}\\pnpm");
-        if Path::new(&pnpm).is_dir() {
-            dirs.push(pnpm);
-        }
-    }
-    for git in [r"C:\Program Files\Git\cmd", r"C:\Program Files (x86)\Git\cmd"] {
-        if Path::new(git).is_dir() {
-            dirs.push(git.to_string());
-        }
-    }
-    if dirs.is_empty() {
-        return;
-    }
-    let mut path = dirs.join(";");
-    if let Ok(p) = std::env::var("PATH") {
-        if !p.is_empty() {
-            path.push(';');
-            path.push_str(&p);
-        }
-    }
-    c.env("PATH", path);
 }
 
 fn git_cmd() -> Command {
@@ -232,10 +346,7 @@ fn dsh_command(settings: &AppSettings) -> Result<Command, String> {
         }
         LaunchSource::Local => {
             let dir = validate_local_repo(&settings.local_path)?;
-            let mut c = base_tool_cmd("pnpm");
-            c.args(["dsh", "web"]);
-            c.current_dir(dir);
-            Ok(c)
+            local_dsh_command(&dir, &["web"])
         }
     }
 }
@@ -252,10 +363,7 @@ fn version_command(settings: &AppSettings) -> Result<Command, String> {
         }
         LaunchSource::Local => {
             let dir = validate_local_repo(&settings.local_path)?;
-            let mut c = base_tool_cmd("pnpm");
-            c.args(["dsh", "--version"]);
-            c.current_dir(dir);
-            Ok(c)
+            local_dsh_command(&dir, &["--version"])
         }
     }
 }
@@ -354,20 +462,21 @@ fn looks_like_dsh_index(buf: &[u8]) -> bool {
     status_ok && text.contains("__DSH_BOOT__")
 }
 
-fn is_web_ready(port: u16) -> bool {
+/// `/api/events.host` returns 426 once the connection plugin has mounted.
+fn looks_like_dsh_api(buf: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(buf);
+    text.starts_with("HTTP/1.1 426") || text.starts_with("HTTP/1.0 426")
+}
+
+fn http_get(port: u16, path: &str) -> Option<Vec<u8>> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
     let req = format!(
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     );
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
+    stream.write_all(req.as_bytes()).ok()?;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -375,14 +484,23 @@ fn is_web_ready(port: u16) -> bool {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
-                if looks_like_dsh_index(&buf) || buf.len() > 64 * 1024 {
+                if buf.len() > 64 * 1024 {
                     break;
                 }
             }
             Err(_) => break,
         }
     }
-    looks_like_dsh_index(&buf)
+    Some(buf)
+}
+
+fn is_web_ready(port: u16) -> bool {
+    let index = http_get(port, "/").unwrap_or_default();
+    if !looks_like_dsh_index(&index) {
+        return false;
+    }
+    let api = http_get(port, "/api/events.host").unwrap_or_default();
+    looks_like_dsh_api(&api)
 }
 
 fn spawn_readiness_poller(app: AppHandle, require_owned: bool) {
@@ -473,7 +591,7 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
     let spawn_err = match settings.source {
         LaunchSource::Npx => "无法启动 npx @deepseek-ai/dsh web".to_string(),
         LaunchSource::Local => format!(
-            "无法启动 pnpm dsh web（{}）",
+            "无法启动本地 dsh（node --import tsx/esm apps/cli/src/bin.ts web @ {}）",
             settings.local_path.trim()
         ),
     };
@@ -754,6 +872,15 @@ mod tests {
     }
 
     #[test]
+    fn local_source_bin_is_cwd_independent() {
+        let dir = PathBuf::from(r"H:\github\deepseek-harness");
+        assert_eq!(
+            local_source_bin(&dir),
+            dir.join("apps").join("cli").join("src").join("bin.ts")
+        );
+    }
+
+    #[test]
     fn looks_like_dsh_index_accepts_boot_html() {
         let res = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><script>window.__DSH_BOOT__={}</script></html>";
         assert!(looks_like_dsh_index(res.as_bytes()));
@@ -766,26 +893,41 @@ mod tests {
     }
 
     #[test]
-    fn is_web_ready_requires_boot_html_not_just_a_listening_port() {
+    fn looks_like_dsh_api_accepts_upgrade_required() {
+        let res = "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\nupgrade required";
+        assert!(looks_like_dsh_api(res.as_bytes()));
+        assert!(!looks_like_dsh_api(b"HTTP/1.1 404 Not Found\r\n\r\n"));
+    }
+
+    #[test]
+    fn is_web_ready_requires_boot_html_and_api_route() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            for body in [
-                b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n".as_slice(),
-                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<html>window.__DSH_BOOT__={}</html>"
-                    .as_slice(),
-            ] {
-                if let Ok((mut s, _)) = listener.accept() {
-                    let mut buf = [0u8; 512];
-                    let _ = s.read(&mut buf);
-                    let _ = s.write_all(body);
-                }
+            let mut started = false;
+            for _ in 0..12 {
+                let Ok((mut s, _)) = listener.accept() else { break };
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body: &[u8] = if !started {
+                    started = true;
+                    b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n"
+                } else if req.contains("/api/events.host") {
+                    b"HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\nupgrade required"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<html>window.__DSH_BOOT__={}</html>"
+                };
+                let _ = s.write_all(body);
             }
         });
         assert!(!is_web_ready(port), "404 during plugin mount must not count as ready");
-        assert!(is_web_ready(port), "200 with __DSH_BOOT__ must count as ready");
+        assert!(
+            is_web_ready(port),
+            "boot HTML plus /api/events.host 426 must count as ready"
+        );
     }
 }

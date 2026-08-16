@@ -27,14 +27,13 @@
 
     <main>
       <section class="panel active" id="panel-app">
-        <div class="app-frame">
+        <div class="app-frame" id="app-frame">
           <div class="loading" id="loading">
             <div class="spinner" id="loading-spinner"></div>
             <p id="loading-text">正在启动 DeepSeek Harness …</p>
             <p class="hint" id="loading-hint" hidden>可在上方 CLI 页签查看详细日志，安装好依赖后可重试。</p>
             <button class="retry-btn" id="btn-retry" hidden>重试启动</button>
           </div>
-          <iframe id="app-iframe" src="about:blank" title="DSH Desktop"></iframe>
         </div>
       </section>
 

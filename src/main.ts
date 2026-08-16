@@ -1,6 +1,9 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 const PORT = 3080;
 const APP_URL = "http://127.0.0.1:" + PORT;
@@ -21,7 +24,7 @@ function q<T extends HTMLElement>(sel: string): T {
   return document.querySelector(sel) as T;
 }
 
-const iframe = q<HTMLIFrameElement>("#app-iframe");
+const DSH_LABEL = "dsh";
 const loading = q<HTMLDivElement>("#loading");
 const log = q<HTMLPreElement>("#log");
 const dot = q<HTMLSpanElement>("#status-dot");
@@ -72,23 +75,77 @@ function showStartupError(message: string): void {
   setLoading(message, { error: true, retry: true });
   showBar();
   appendLog("> " + message, "err");
+  void closeDshWindow();
 }
 
-function showApp(): void {
-  const finish = () => {
-    iframe.removeEventListener("load", finish);
-    loading.style.display = "none";
-  };
-  iframe.addEventListener("load", finish);
-  if (iframe.getAttribute("src") === APP_URL) {
-    try {
-      iframe.contentWindow?.location.reload();
-    } catch {
-      iframe.src = APP_URL;
-    }
-  } else {
-    iframe.src = APP_URL;
+async function dshWindow(): Promise<WebviewWindow | null> {
+  return WebviewWindow.getByLabel(DSH_LABEL);
+}
+
+function dshTopInset(): number {
+  return topbar.classList.contains("visible") ? 52 : 8;
+}
+
+async function syncDshBounds(): Promise<void> {
+  const wdw = await dshWindow();
+  if (!wdw || cliMode || !ready) return;
+  const main = getCurrentWindow();
+  const scale = await main.scaleFactor();
+  const origin = await main.innerPosition();
+  const size = await main.innerSize();
+  const top = dshTopInset();
+  const x = origin.x / scale;
+  const y = origin.y / scale + top;
+  const width = size.width / scale;
+  const height = Math.max(80, size.height / scale - top);
+  await wdw.setPosition(new LogicalPosition(x, y));
+  await wdw.setSize(new LogicalSize(width, height));
+}
+
+async function hideDshWindow(): Promise<void> {
+  const wdw = await dshWindow();
+  if (wdw) await wdw.hide();
+}
+
+async function closeDshWindow(): Promise<void> {
+  const wdw = await dshWindow();
+  if (wdw) await wdw.close();
+}
+
+async function showApp(): Promise<void> {
+  loading.style.display = "none";
+  if (cliMode) {
+    await hideDshWindow();
+    return;
   }
+  let wdw = await dshWindow();
+  if (!wdw) {
+    const main = getCurrentWindow();
+    wdw = new WebviewWindow(DSH_LABEL, {
+      url: APP_URL,
+      parent: main,
+      decorations: false,
+      skipTaskbar: true,
+      resizable: false,
+      shadow: false,
+      focus: true,
+    });
+    await new Promise<void>((resolve, reject) => {
+      const t = window.setTimeout(() => reject(new Error("创建 dsh 窗口超时")), 8000);
+      wdw!.once("tauri://created", () => {
+        window.clearTimeout(t);
+        resolve();
+      });
+      wdw!.once("tauri://error", (e) => {
+        window.clearTimeout(t);
+        reject(e.payload ?? e);
+      });
+    });
+    appendLog("> 已用独立窗口加载 Web UI（避免 iframe 跨站拦截插件）", "sys");
+  } else {
+    await wdw.show();
+  }
+  await syncDshBounds();
 }
 
 function showBar(): void {
@@ -98,6 +155,7 @@ function showBar(): void {
   }
   topbar.classList.add("visible");
   grabber.classList.add("hidden");
+  void syncDshBounds();
 }
 
 function scheduleHide(): void {
@@ -106,6 +164,7 @@ function scheduleHide(): void {
     topbar.classList.remove("visible");
     grabber.classList.remove("hidden");
     hideTimer = undefined;
+    void syncDshBounds();
   }, 1500);
 }
 
@@ -129,7 +188,7 @@ function setupBar(): void {
 
 function launchCommandLabel(): string {
   return settings.source === "local"
-    ? "pnpm dsh web  (" + settings.localPath + ")"
+    ? "node --import tsx/esm apps/cli/src/bin.ts web  (" + settings.localPath + ")"
     : "npx @deepseek-ai/dsh web";
 }
 
@@ -162,6 +221,7 @@ async function stop(): Promise<void> {
     setStatus("running", "运行中 · " + APP_URL);
   } else {
     setStatus("stopped", "已停止");
+    await closeDshWindow();
   }
 }
 
@@ -188,8 +248,8 @@ async function upgrade(): Promise<void> {
     if (r.ok) {
       appendLog("> 已安装版本 " + r.version + " · " + r.message, "sys");
       if (r.restarted) {
-        iframe.src = "about:blank";
-        showApp();
+        await closeDshWindow();
+        await showApp();
       }
     } else {
       appendLog("> 升级失败：" + r.message, "err");
@@ -232,9 +292,11 @@ function setupTabs(): void {
       if (key === "cli") {
         cliMode = true;
         showBar();
+        void hideDshWindow();
       } else {
         cliMode = false;
         scheduleHide();
+        if (ready) void showApp();
       }
     });
   });
@@ -246,7 +308,7 @@ async function setupEvents(): Promise<void> {
   await listen("server:ready", () => {
     ready = true;
     setStatus("running", "运行中 · " + APP_URL);
-    showApp();
+    void showApp();
     appendLog("> 就绪：" + APP_URL, "sys");
     refreshDshVersion();
     if (!cliMode) scheduleHide();
@@ -258,6 +320,7 @@ async function setupEvents(): Promise<void> {
     if (ready) {
       setStatus("stopped", "已退出");
       appendLog("> 进程已退出 (code=" + e.payload + ")", "sys");
+      void closeDshWindow();
     } else {
       showStartupError("启动失败：进程提前退出（退出码 " + e.payload + "），请检查 CLI 日志");
     }
@@ -357,6 +420,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!cliMode) scheduleHide();
   }, 5000);
   q("#version").textContent = "dsh …";
+  const main = getCurrentWindow();
+  await main.onResized(() => {
+    void syncDshBounds();
+  });
+  await main.onMoved(() => {
+    void syncDshBounds();
+  });
   await setupEvents();
   try {
     const s = await invoke<any>("server_status");
