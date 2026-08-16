@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -345,6 +345,66 @@ fn is_port_open(port: u16) -> bool {
     TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
 
+/// dsh web binds the port immediately, then answers 404 until frontend-static
+/// mounts. The real page injects `window.__DSH_BOOT__`; TCP-only readiness
+/// loads that 404 into the iframe and leaves a white screen.
+fn looks_like_dsh_index(buf: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(buf);
+    let status_ok = text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200");
+    status_ok && text.contains("__DSH_BOOT__")
+}
+
+fn is_web_ready(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if looks_like_dsh_index(&buf) || buf.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    looks_like_dsh_index(&buf)
+}
+
+fn spawn_readiness_poller(app: AppHandle, require_owned: bool) {
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if is_web_ready(PORT) {
+                let _ = app.emit("server:ready", ());
+                return;
+            }
+            if require_owned && app.state::<ServerState>().pid.lock().unwrap().is_none() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                let _ = app.emit("server:timeout", ());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {
     unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
@@ -389,10 +449,16 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
         }
     }
 
-    // Port already serving (e.g. the user's browser dsh session)? Reuse it
-    // instead of spawning a duplicate that would fail with EADDRINUSE.
-    if is_port_open(PORT) {
+    // Port already serving a fully-booted dsh (e.g. a browser session)?
+    // Reuse it instead of spawning a duplicate that would fail with EADDRINUSE.
+    // TCP-only is not enough: dsh binds immediately and 404s until the
+    // frontend plugin mounts, which is what used to white-screen the iframe.
+    if is_web_ready(PORT) {
         let _ = app.emit("server:ready", ());
+        return Ok(status_of(app, true));
+    }
+    if is_port_open(PORT) {
+        spawn_readiness_poller(app.clone(), false);
         return Ok(status_of(app, true));
     }
 
@@ -440,28 +506,7 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
         });
     }
 
-    // readiness polling; aborts early when the process exits before the
-    // port opens (e.g. node/npx missing) so the UI reports failure at once
-    {
-        let app = app.clone();
-        std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(90);
-            loop {
-                if is_port_open(PORT) {
-                    let _ = app.emit("server:ready", ());
-                    return;
-                }
-                if app.state::<ServerState>().pid.lock().unwrap().is_none() {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    let _ = app.emit("server:timeout", ());
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        });
-    }
+    spawn_readiness_poller(app.clone(), true);
 
     Ok(status_of(app, true))
 }
@@ -706,5 +751,41 @@ mod tests {
         assert!(validate_local_repo("").is_err());
         assert!(validate_local_repo("   ").is_err());
         assert!(validate_local_repo("Z:\\definitely-not-a-dsh-repo").is_err());
+    }
+
+    #[test]
+    fn looks_like_dsh_index_accepts_boot_html() {
+        let res = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><script>window.__DSH_BOOT__={}</script></html>";
+        assert!(looks_like_dsh_index(res.as_bytes()));
+    }
+
+    #[test]
+    fn looks_like_dsh_index_rejects_startup_404() {
+        let res = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+        assert!(!looks_like_dsh_index(res.as_bytes()));
+    }
+
+    #[test]
+    fn is_web_ready_requires_boot_html_not_just_a_listening_port() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for body in [
+                b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n<html>window.__DSH_BOOT__={}</html>"
+                    .as_slice(),
+            ] {
+                if let Ok((mut s, _)) = listener.accept() {
+                    let mut buf = [0u8; 512];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(body);
+                }
+            }
+        });
+        assert!(!is_web_ready(port), "404 during plugin mount must not count as ready");
+        assert!(is_web_ready(port), "200 with __DSH_BOOT__ must count as ready");
     }
 }

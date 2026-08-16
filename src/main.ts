@@ -75,8 +75,20 @@ function showStartupError(message: string): void {
 }
 
 function showApp(): void {
-  loading.style.display = "none";
-  if (iframe.src !== APP_URL) iframe.src = APP_URL;
+  const finish = () => {
+    iframe.removeEventListener("load", finish);
+    loading.style.display = "none";
+  };
+  iframe.addEventListener("load", finish);
+  if (iframe.getAttribute("src") === APP_URL) {
+    try {
+      iframe.contentWindow?.location.reload();
+    } catch {
+      iframe.src = APP_URL;
+    }
+  } else {
+    iframe.src = APP_URL;
+  }
 }
 
 function showBar(): void {
@@ -349,13 +361,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     const s = await invoke<any>("server_status");
     if (s.running) {
-      showApp();
-      setStatus("running", "运行中 · " + s.url);
-      appendLog("> 检测到 " + s.url + " 已有服务，直接复用（该服务非本应用启动）", "sys");
-    } else {
-      await start();
+      appendLog("> 检测到 " + s.url + " 已有端口，等待 Web UI 就绪…", "sys");
     }
   } catch {
-    await start();
+    /* start() will report its own errors */
   }
+  await start();
 });
