@@ -64,6 +64,7 @@ let dshFocusBound = false;
 function startThemeSync(): void {
   const tick = () => {
     void invoke("sync_dsh_theme");
+    void invoke("inject_dsh_desktop_css");
     if (!cliMode && !chromeOpen()) {
       void invoke("raise_overlay", { label: CHROME_BTN_LABEL });
       void syncChromeBtnBounds();
@@ -291,6 +292,7 @@ async function showApp(): Promise<void> {
       resizable: false,
       shadow: false,
       focus: true,
+      zoomHotkeysEnabled: true,
     });
     await new Promise<void>((resolve, reject) => {
       const t = window.setTimeout(() => reject(new Error("创建 dsh 窗口超时")), 8000);

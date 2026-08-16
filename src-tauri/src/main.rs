@@ -890,6 +890,29 @@ fn sync_dsh_theme(app: AppHandle) {
     });
 }
 
+const INJECT_WIDE_CHAT_JS: &str = r#"
+(() => {
+  const id = "dsh-desktop-wide-chat";
+  if (!document.getElementById(id)) {
+    const style = document.createElement("style");
+    style.id = id;
+    style.textContent = "html.dsh-desktop-wide-chat,html.dsh-desktop-wide-chat *{--dsh-chat-content-width:100%!important;--dsh-composer-card-max-width:100%!important;}";
+    document.documentElement.classList.add("dsh-desktop-wide-chat");
+    (document.head || document.documentElement).appendChild(style);
+  }
+  return true;
+})()
+"#;
+
+/// Widen the Conversation tab past Harness's 748px content cap.
+#[tauri::command]
+fn inject_dsh_desktop_css(app: AppHandle) {
+    let Some(wdw) = app.get_webview_window("dsh") else {
+        return;
+    };
+    let _ = wdw.eval(INJECT_WIDE_CHAT_JS);
+}
+
 #[cfg(windows)]
 fn raise_win32(wdw: &tauri::WebviewWindow) {
     let Ok(hwnd) = wdw.hwnd() else {
@@ -999,6 +1022,7 @@ fn main() {
             upgrade_dsh,
             dsh_version,
             sync_dsh_theme,
+            inject_dsh_desktop_css,
             raise_overlay
         ])
         .setup(|app| setup_tray(app))
