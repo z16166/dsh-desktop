@@ -996,6 +996,65 @@ fn raise_overlay(app: AppHandle, label: String) {
     raise_win32(&wdw);
 }
 
+/// True when the process token is elevated (launched via UAC / as administrator).
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token: isize,
+            class: i32,
+            info: *mut std::ffi::c_void,
+            info_len: u32,
+            return_len: *mut u32,
+        ) -> i32;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION: i32 = 20;
+
+    unsafe {
+        let mut token: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation: u32 = 0;
+        let mut written: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_ELEVATION,
+            &mut elevation as *mut u32 as *mut std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            &mut written,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation != 0
+    }
+}
+
+#[cfg(windows)]
+fn mark_elevated_title(app: &tauri::App) {
+    const SUFFIX: &str = " (Elevated)";
+    if !is_elevated() {
+        return;
+    }
+    let Some(main) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(title) = main.title() else {
+        return;
+    };
+    if title.ends_with(SUFFIX) {
+        return;
+    }
+    let _ = main.set_title(&format!("{title}{SUFFIX}"));
+}
+
 fn hide_to_tray(app: &AppHandle) {
     for label in ["dsh", "chrome-btn"] {
         if let Some(wdw) = app.get_webview_window(label) {
@@ -1063,7 +1122,11 @@ fn main() {
             inject_dsh_desktop_css,
             raise_overlay
         ])
-        .setup(|app| setup_tray(app))
+        .setup(|app| {
+            #[cfg(windows)]
+            mark_elevated_title(app);
+            setup_tray(app)
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
