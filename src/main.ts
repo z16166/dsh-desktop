@@ -61,14 +61,25 @@ let lastDshTheme: DshTheme | null = null;
 let themeTimer: number | undefined;
 let dshFocusBound = false;
 
+async function mainIsMinimized(): Promise<boolean> {
+  try {
+    return await getCurrentWindow().isMinimized();
+  } catch {
+    return false;
+  }
+}
+
 function startThemeSync(): void {
   const tick = () => {
     void invoke("sync_dsh_theme");
     void invoke("inject_dsh_desktop_css");
-    if (!cliMode && !chromeOpen()) {
-      void invoke("raise_overlay", { label: CHROME_BTN_LABEL });
-      void syncChromeBtnBounds();
-    }
+    void (async () => {
+      if (await mainIsMinimized()) return;
+      if (!cliMode && !chromeOpen()) {
+        void invoke("raise_overlay", { label: CHROME_BTN_LABEL });
+        void syncChromeBtnBounds();
+      }
+    })();
   };
   tick();
   if (themeTimer === undefined) {
@@ -162,6 +173,7 @@ async function dshWindow(): Promise<WebviewWindow | null> {
 async function syncDshBounds(): Promise<void> {
   const wdw = await dshWindow();
   if (!wdw || cliMode || !ready) return;
+  if (await mainIsMinimized()) return;
   const main = getCurrentWindow();
   const scale = await main.scaleFactor();
   const origin = await main.innerPosition();
@@ -173,6 +185,19 @@ async function syncDshBounds(): Promise<void> {
   const height = Math.max(80, rect.height);
   await wdw.setPosition(new LogicalPosition(x, y));
   await wdw.setSize(new LogicalSize(width, height));
+}
+
+async function onMainGeometryChanged(): Promise<void> {
+  if (await mainIsMinimized()) {
+    await hideDshWindow();
+    await hideChromeBtn();
+    return;
+  }
+  if (ready && !cliMode) {
+    const wdw = await dshWindow();
+    if (wdw) await wdw.show();
+  }
+  await syncOverlayBounds();
 }
 
 async function syncOverlayBounds(): Promise<void> {
@@ -217,6 +242,7 @@ async function ensureChromeBtn(): Promise<WebviewWindow> {
 async function syncChromeBtnBounds(): Promise<void> {
   const wdw = await chromeBtnWindow();
   if (!wdw) return;
+  if (await mainIsMinimized()) return;
   const main = getCurrentWindow();
   const scale = await main.scaleFactor();
   const origin = await main.innerPosition();
@@ -247,7 +273,7 @@ async function hideChromeBtn(): Promise<void> {
 }
 
 async function raiseChromeBtn(): Promise<void> {
-  if (cliMode || chromeOpen()) {
+  if (cliMode || chromeOpen() || (await mainIsMinimized())) {
     await hideChromeBtn();
     return;
   }
@@ -276,7 +302,7 @@ async function closeDshWindow(): Promise<void> {
 
 async function showApp(): Promise<void> {
   loading.style.display = "none";
-  if (cliMode) {
+  if (cliMode || (await mainIsMinimized())) {
     await hideDshWindow();
     await hideChromeBtn();
     return;
@@ -565,10 +591,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   q("#version").textContent = "dsh …";
   const main = getCurrentWindow();
   await main.onResized(() => {
-    void syncOverlayBounds();
+    void onMainGeometryChanged();
   });
   await main.onMoved(() => {
-    void syncOverlayBounds();
+    void onMainGeometryChanged();
+  });
+  await main.onFocusChanged(() => {
+    void onMainGeometryChanged();
   });
   await setupEvents();
   try {

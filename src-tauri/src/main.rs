@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,29 @@ fn url() -> String {
 
 struct ServerState {
     pid: Mutex<Option<u32>>,
+}
+
+struct MinimizeState(AtomicBool);
+
+const OWNED_OVERLAY_LABELS: [&str; 2] = ["dsh", "chrome-btn"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MinimizeTransition {
+    None,
+    Minimized,
+    Restored,
+}
+
+fn minimize_transition(was_minimized: bool, is_minimized: bool) -> MinimizeTransition {
+    match (was_minimized, is_minimized) {
+        (false, true) => MinimizeTransition::Minimized,
+        (true, false) => MinimizeTransition::Restored,
+        _ => MinimizeTransition::None,
+    }
+}
+
+fn should_show_owned_overlay(main_minimized: bool) -> bool {
+    !main_minimized
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -952,13 +976,10 @@ fn inject_dsh_desktop_css(app: AppHandle) {
 }
 
 #[cfg(windows)]
-fn raise_win32(wdw: &tauri::WebviewWindow) {
-    let Ok(hwnd) = wdw.hwnd() else {
-        return;
-    };
+mod win32 {
     #[link(name = "user32")]
     extern "system" {
-        fn SetWindowPos(
+        pub fn SetWindowPos(
             hwnd: isize,
             insert_after: isize,
             x: i32,
@@ -967,30 +988,106 @@ fn raise_win32(wdw: &tauri::WebviewWindow) {
             cy: i32,
             flags: u32,
         ) -> i32;
+        pub fn GetWindowLongW(hwnd: isize, n_index: i32) -> i32;
+        pub fn SetWindowLongW(hwnd: isize, n_index: i32, dw_new_long: i32) -> i32;
     }
+}
+
+#[cfg(windows)]
+fn apply_tool_window_hwnd(hwnd: isize) {
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_APPWINDOW: i32 = 0x0004_0000;
+    const WS_EX_TOOLWINDOW: i32 = 0x0000_0080;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
+    unsafe {
+        let ex = win32::GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let new_ex = (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
+        if new_ex == ex {
+            return;
+        }
+        win32::SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex);
+        win32::SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn apply_tool_window_style(wdw: &tauri::WebviewWindow) {
+    let Ok(hwnd) = wdw.hwnd() else {
+        return;
+    };
+    apply_tool_window_hwnd(hwnd.0 as isize);
+}
+
+#[cfg(windows)]
+fn raise_win32(wdw: &tauri::WebviewWindow) {
+    let Ok(hwnd) = wdw.hwnd() else {
+        return;
+    };
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOACTIVATE: u32 = 0x0010;
-    const SWP_SHOWWINDOW: u32 = 0x0040;
     unsafe {
-        SetWindowPos(
+        win32::SetWindowPos(
             hwnd.0 as isize,
             0,
             0,
             0,
             0,
             0,
-            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
         );
+    }
+}
+
+fn is_main_minimized(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|w| w.is_minimized().ok())
+        .unwrap_or(false)
+}
+
+fn hide_owned_overlays(app: &AppHandle) {
+    for label in OWNED_OVERLAY_LABELS {
+        if let Some(wdw) = app.get_webview_window(label) {
+            let _ = wdw.hide();
+        }
+    }
+}
+
+fn handle_main_minimize_event(app: &AppHandle, is_minimized: bool) {
+    let state = app.state::<MinimizeState>();
+    let was_minimized = state.0.swap(is_minimized, Ordering::SeqCst);
+    match minimize_transition(was_minimized, is_minimized) {
+        MinimizeTransition::None => {}
+        MinimizeTransition::Minimized => hide_owned_overlays(app),
+        MinimizeTransition::Restored => {
+            let _ = app.emit("app:restore", ());
+        }
     }
 }
 
 /// Show `label` above sibling webviews (dsh) without recreating it.
 #[tauri::command]
 fn raise_overlay(app: AppHandle, label: String) {
+    if !should_show_owned_overlay(is_main_minimized(&app)) {
+        return;
+    }
     let Some(wdw) = app.get_webview_window(&label) else {
         return;
     };
+    #[cfg(windows)]
+    apply_tool_window_style(&wdw);
     let _ = wdw.show();
     #[cfg(windows)]
     raise_win32(&wdw);
@@ -1056,11 +1153,7 @@ fn mark_elevated_title(app: &tauri::App) {
 }
 
 fn hide_to_tray(app: &AppHandle) {
-    for label in ["dsh", "chrome-btn"] {
-        if let Some(wdw) = app.get_webview_window(label) {
-            let _ = wdw.hide();
-        }
-    }
+    hide_owned_overlays(app);
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
     }
@@ -1109,6 +1202,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     tauri::Builder::default()
         .manage(ServerState { pid: Mutex::new(None) })
+        .manage(MinimizeState(AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
@@ -1128,13 +1222,30 @@ fn main() {
             setup_tray(app)
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    api.prevent_close();
-                    hide_to_tray(window.app_handle());
-                } else if window.label() == "chrome-btn" {
-                    api.prevent_close();
+            #[cfg(windows)]
+            if matches!(window.label(), "dsh" | "chrome-btn") {
+                if let Ok(hwnd) = window.hwnd() {
+                    apply_tool_window_hwnd(hwnd.0 as isize);
                 }
+            }
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if window.label() == "main" {
+                        api.prevent_close();
+                        hide_to_tray(window.app_handle());
+                    } else if window.label() == "chrome-btn" {
+                        api.prevent_close();
+                    }
+                }
+                tauri::WindowEvent::Resized(_)
+                | tauri::WindowEvent::Moved(_)
+                | tauri::WindowEvent::Focused(_) => {
+                    if window.label() == "main" {
+                        let minimized = window.is_minimized().unwrap_or(false);
+                        handle_main_minimize_event(window.app_handle(), minimized);
+                    }
+                }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())
@@ -1204,6 +1315,33 @@ mod tests {
         let res = "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\nupgrade required";
         assert!(looks_like_dsh_api(res.as_bytes()));
         assert!(!looks_like_dsh_api(b"HTTP/1.1 404 Not Found\r\n\r\n"));
+    }
+
+    #[test]
+    fn minimize_transition_only_fires_on_edge() {
+        assert_eq!(
+            minimize_transition(false, false),
+            MinimizeTransition::None
+        );
+        assert_eq!(
+            minimize_transition(true, true),
+            MinimizeTransition::None
+        );
+        assert_eq!(
+            minimize_transition(false, true),
+            MinimizeTransition::Minimized
+        );
+        assert_eq!(
+            minimize_transition(true, false),
+            MinimizeTransition::Restored
+        );
+    }
+
+    #[test]
+    fn owned_overlays_stay_hidden_while_main_is_minimized() {
+        assert!(!should_show_owned_overlay(true));
+        assert!(should_show_owned_overlay(false));
+        assert_eq!(OWNED_OVERLAY_LABELS, ["dsh", "chrome-btn"]);
     }
 
     #[test]
