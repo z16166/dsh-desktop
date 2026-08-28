@@ -60,10 +60,15 @@ let ready = false;
 let lastDshTheme: DshTheme | null = null;
 let themeTimer: number | undefined;
 let dshFocusBound = false;
+let withdrawn = false;
 
-async function mainIsMinimized(): Promise<boolean> {
+async function mainAllowsOverlays(): Promise<boolean> {
+  if (withdrawn) return false;
   try {
-    return await getCurrentWindow().isMinimized();
+    const main = getCurrentWindow();
+    if (await main.isMinimized()) return false;
+    if (!(await main.isVisible())) return false;
+    return true;
   } catch {
     return false;
   }
@@ -74,7 +79,7 @@ function startThemeSync(): void {
     void invoke("sync_dsh_theme");
     void invoke("inject_dsh_desktop_css");
     void (async () => {
-      if (await mainIsMinimized()) return;
+      if (!(await mainAllowsOverlays())) return;
       if (!cliMode && !chromeOpen()) {
         void invoke("raise_overlay", { label: CHROME_BTN_LABEL });
         void syncChromeBtnBounds();
@@ -173,7 +178,7 @@ async function dshWindow(): Promise<WebviewWindow | null> {
 async function syncDshBounds(): Promise<void> {
   const wdw = await dshWindow();
   if (!wdw || cliMode || !ready) return;
-  if (await mainIsMinimized()) return;
+  if (!(await mainAllowsOverlays())) return;
   const main = getCurrentWindow();
   const scale = await main.scaleFactor();
   const origin = await main.innerPosition();
@@ -188,7 +193,7 @@ async function syncDshBounds(): Promise<void> {
 }
 
 async function onMainGeometryChanged(): Promise<void> {
-  if (await mainIsMinimized()) {
+  if (!(await mainAllowsOverlays())) {
     await hideDshWindow();
     await hideChromeBtn();
     return;
@@ -242,7 +247,7 @@ async function ensureChromeBtn(): Promise<WebviewWindow> {
 async function syncChromeBtnBounds(): Promise<void> {
   const wdw = await chromeBtnWindow();
   if (!wdw) return;
-  if (await mainIsMinimized()) return;
+  if (!(await mainAllowsOverlays())) return;
   const main = getCurrentWindow();
   const scale = await main.scaleFactor();
   const origin = await main.innerPosition();
@@ -273,7 +278,7 @@ async function hideChromeBtn(): Promise<void> {
 }
 
 async function raiseChromeBtn(): Promise<void> {
-  if (cliMode || chromeOpen() || (await mainIsMinimized())) {
+  if (cliMode || chromeOpen() || !(await mainAllowsOverlays())) {
     await hideChromeBtn();
     return;
   }
@@ -302,7 +307,7 @@ async function closeDshWindow(): Promise<void> {
 
 async function showApp(): Promise<void> {
   loading.style.display = "none";
-  if (cliMode || (await mainIsMinimized())) {
+  if (cliMode || !(await mainAllowsOverlays())) {
     await hideDshWindow();
     await hideChromeBtn();
     return;
@@ -493,7 +498,13 @@ async function setupEvents(): Promise<void> {
   });
   await listen<string>("upgrade:stdout", (e2) => appendLog(e2.payload, "out"));
   await listen<string>("upgrade:stderr", (e2) => appendLog(e2.payload, "err"));
+  await listen("app:withdraw", () => {
+    withdrawn = true;
+    void hideDshWindow();
+    void hideChromeBtn();
+  });
   await listen("app:restore", () => {
+    withdrawn = false;
     if (ready && !cliMode) void showApp();
   });
   await listen("chrome:show", () => {

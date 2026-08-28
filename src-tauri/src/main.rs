@@ -25,7 +25,10 @@ struct ServerState {
     pid: Mutex<Option<u32>>,
 }
 
-struct MinimizeState(AtomicBool);
+struct ShellState {
+    minimized: AtomicBool,
+    withdrawn: AtomicBool,
+}
 
 const OWNED_OVERLAY_LABELS: [&str; 2] = ["dsh", "chrome-btn"];
 
@@ -44,8 +47,8 @@ fn minimize_transition(was_minimized: bool, is_minimized: bool) -> MinimizeTrans
     }
 }
 
-fn should_show_owned_overlay(main_minimized: bool) -> bool {
-    !main_minimized
+fn should_show_owned_overlay(main_minimized: bool, main_visible: bool) -> bool {
+    main_visible && !main_minimized
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1051,10 +1054,17 @@ fn raise_win32(wdw: &tauri::WebviewWindow) {
     }
 }
 
-fn is_main_minimized(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
-        .and_then(|w| w.is_minimized().ok())
-        .unwrap_or(false)
+fn overlays_allowed(app: &AppHandle) -> bool {
+    let withdrawn = app.state::<ShellState>().withdrawn.load(Ordering::SeqCst);
+    if withdrawn {
+        return false;
+    }
+    let Some(main) = app.get_webview_window("main") else {
+        return false;
+    };
+    let visible = main.is_visible().unwrap_or(false);
+    let minimized = main.is_minimized().unwrap_or(false);
+    should_show_owned_overlay(minimized, visible)
 }
 
 fn hide_owned_overlays(app: &AppHandle) {
@@ -1066,8 +1076,12 @@ fn hide_owned_overlays(app: &AppHandle) {
 }
 
 fn handle_main_minimize_event(app: &AppHandle, is_minimized: bool) {
-    let state = app.state::<MinimizeState>();
-    let was_minimized = state.0.swap(is_minimized, Ordering::SeqCst);
+    let state = app.state::<ShellState>();
+    if state.withdrawn.load(Ordering::SeqCst) {
+        hide_owned_overlays(app);
+        return;
+    }
+    let was_minimized = state.minimized.swap(is_minimized, Ordering::SeqCst);
     match minimize_transition(was_minimized, is_minimized) {
         MinimizeTransition::None => {}
         MinimizeTransition::Minimized => hide_owned_overlays(app),
@@ -1080,7 +1094,7 @@ fn handle_main_minimize_event(app: &AppHandle, is_minimized: bool) {
 /// Show `label` above sibling webviews (dsh) without recreating it.
 #[tauri::command]
 fn raise_overlay(app: AppHandle, label: String) {
-    if !should_show_owned_overlay(is_main_minimized(&app)) {
+    if !overlays_allowed(&app) {
         return;
     }
     let Some(wdw) = app.get_webview_window(&label) else {
@@ -1153,6 +1167,10 @@ fn mark_elevated_title(app: &tauri::App) {
 }
 
 fn hide_to_tray(app: &AppHandle) {
+    app.state::<ShellState>()
+        .withdrawn
+        .store(true, Ordering::SeqCst);
+    let _ = app.emit("app:withdraw", ());
     hide_owned_overlays(app);
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
@@ -1160,6 +1178,9 @@ fn hide_to_tray(app: &AppHandle) {
 }
 
 fn restore_from_tray(app: &AppHandle) {
+    app.state::<ShellState>()
+        .withdrawn
+        .store(false, Ordering::SeqCst);
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.unminimize();
         let _ = main.show();
@@ -1202,7 +1223,10 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     tauri::Builder::default()
         .manage(ServerState { pid: Mutex::new(None) })
-        .manage(MinimizeState(AtomicBool::new(false)))
+        .manage(ShellState {
+            minimized: AtomicBool::new(false),
+            withdrawn: AtomicBool::new(false),
+        })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_settings,
@@ -1338,9 +1362,14 @@ mod tests {
     }
 
     #[test]
-    fn owned_overlays_stay_hidden_while_main_is_minimized() {
-        assert!(!should_show_owned_overlay(true));
-        assert!(should_show_owned_overlay(false));
+    fn owned_overlays_stay_hidden_while_main_is_minimized_or_hidden() {
+        assert!(!should_show_owned_overlay(true, true));
+        assert!(!should_show_owned_overlay(true, false));
+        assert!(
+            !should_show_owned_overlay(false, false),
+            "hide-to-tray must not resurrect the frameless dsh overlay"
+        );
+        assert!(should_show_owned_overlay(false, true));
         assert_eq!(OWNED_OVERLAY_LABELS, ["dsh", "chrome-btn"]);
     }
 
