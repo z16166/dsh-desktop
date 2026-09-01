@@ -353,8 +353,8 @@ async function showApp(): Promise<void> {
 
 function launchCommandLabel(): string {
   return settings.source === "local"
-    ? "node --import tsx/esm apps/cli/src/bin.ts web  (" + settings.localPath + ")"
-    : "npx @deepseek-ai/dsh web";
+    ? "node --import tsx/esm apps/cli/src/bin.ts web --no-open  (" + settings.localPath + ")"
+    : "npx @deepseek-ai/dsh web --no-open";
 }
 
 function syncSourceControls(): void {

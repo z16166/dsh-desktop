@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+#[cfg(windows)]
+use std::sync::atomic::{AtomicIsize, AtomicU32};
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
@@ -16,6 +19,52 @@ use tauri::{AppHandle, Emitter, Manager};
 use std::os::unix::process::CommandExt;
 
 const PORT: u16 = 3080;
+
+/// Public `dsh web` argv. `--no-open` is the documented flag that disables
+/// opening the default browser after the Web UI binds.
+const DSH_WEB_ARGS: &[&str] = &["web", "--no-open"];
+
+fn pid_is_under_root_with(pid: u32, root: u32, parent_of: impl Fn(u32) -> Option<u32>) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+        if current == root {
+            return true;
+        }
+        match parent_of(current) {
+            Some(parent) if parent != 0 && parent != current => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn allow_overlay_z_raise(picker_showing: bool, foreground_is_ours: bool) -> bool {
+    !picker_showing && foreground_is_ours
+}
+
+fn should_lift_foreign_window(
+    class: &str,
+    window_pid: u32,
+    our_pid: u32,
+    in_dsh_tree: bool,
+    foreground_is_ours: bool,
+    is_visible_toplevel: bool,
+) -> bool {
+    if !is_visible_toplevel || window_pid == our_pid {
+        return false;
+    }
+    if in_dsh_tree {
+        return true;
+    }
+    class == "#32770" && foreground_is_ours
+}
+
+fn remember_dsh_root_pid(pid: Option<u32>) {
+    #[cfg(windows)]
+    DSH_ROOT_PID.store(pid.unwrap_or(0), Ordering::SeqCst);
+    #[cfg(not(windows))]
+    let _ = pid;
+}
 
 fn url() -> String {
     format!("http://127.0.0.1:{PORT}")
@@ -370,12 +419,13 @@ fn dsh_command(settings: &AppSettings) -> Result<Command, String> {
     match settings.source {
         LaunchSource::Npx => {
             let mut c = base_tool_cmd("npx");
-            c.args(["--yes", "@deepseek-ai/dsh", "web"]);
+            c.args(["--yes", "@deepseek-ai/dsh"]);
+            c.args(DSH_WEB_ARGS);
             Ok(c)
         }
         LaunchSource::Local => {
             let dir = validate_local_repo(&settings.local_path)?;
-            local_dsh_command(&dir, &["web"])
+            local_dsh_command(&dir, DSH_WEB_ARGS)
         }
     }
 }
@@ -639,6 +689,11 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
         let mut guard = state.pid.lock().unwrap();
         *guard = Some(pid);
     }
+    remember_dsh_root_pid(Some(pid));
+    #[cfg(windows)]
+    unsafe {
+        win32::AllowSetForegroundWindow(pid);
+    }
 
     // watcher: clear state and notify on exit
     {
@@ -649,6 +704,7 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
             let mut guard = state.pid.lock().unwrap();
             *guard = None;
             drop(guard);
+            remember_dsh_root_pid(None);
             let _ = app.emit("server:exited", code);
         });
     }
@@ -684,6 +740,7 @@ fn stop_server(app: AppHandle) -> Status {
         let mut guard = state.pid.lock().unwrap();
         guard.take()
     };
+    remember_dsh_root_pid(None);
     match pid {
         Some(pid) => {
             kill_process_group(pid);
@@ -979,7 +1036,28 @@ fn inject_dsh_desktop_css(app: AppHandle) {
 }
 
 #[cfg(windows)]
+static DSH_ROOT_PID: AtomicU32 = AtomicU32::new(0);
+#[cfg(windows)]
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+#[cfg(windows)]
+static PICKER_HWND: AtomicIsize = AtomicIsize::new(0);
+
+#[cfg(windows)]
 mod win32 {
+    #[repr(C)]
+    pub struct ProcessEntry32W {
+        pub dw_size: u32,
+        pub cnt_usage: u32,
+        pub th32_process_id: u32,
+        pub th32_default_heap_id: usize,
+        pub th32_module_id: u32,
+        pub cnt_threads: u32,
+        pub th32_parent_process_id: u32,
+        pub pc_pri_class_base: i32,
+        pub dw_flags: u32,
+        pub sz_exe_file: [u16; 260],
+    }
+
     #[link(name = "user32")]
     extern "system" {
         pub fn SetWindowPos(
@@ -993,6 +1071,46 @@ mod win32 {
         ) -> i32;
         pub fn GetWindowLongW(hwnd: isize, n_index: i32) -> i32;
         pub fn SetWindowLongW(hwnd: isize, n_index: i32, dw_new_long: i32) -> i32;
+        pub fn SetWindowLongPtrW(hwnd: isize, n_index: i32, dw_new_long: isize) -> isize;
+        pub fn GetClassNameW(hwnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
+        pub fn GetWindowThreadProcessId(hwnd: isize, lpdw_process_id: *mut u32) -> u32;
+        pub fn GetForegroundWindow() -> isize;
+        pub fn GetAncestor(hwnd: isize, ga_flags: u32) -> isize;
+        pub fn IsWindow(hwnd: isize) -> i32;
+        pub fn IsWindowVisible(hwnd: isize) -> i32;
+        pub fn SetForegroundWindow(hwnd: isize) -> i32;
+        pub fn BringWindowToTop(hwnd: isize) -> i32;
+        pub fn AllowSetForegroundWindow(process_id: u32) -> i32;
+        pub fn EnumWindows(
+            lp_enum_func: unsafe extern "system" fn(isize, isize) -> i32,
+            l_param: isize,
+        ) -> i32;
+        pub fn SetWinEventHook(
+            event_min: u32,
+            event_max: u32,
+            hmod_win_event_proc: isize,
+            pfn_win_event_proc: unsafe extern "system" fn(
+                isize,
+                u32,
+                isize,
+                i32,
+                i32,
+                u32,
+                u32,
+            ),
+            id_process: u32,
+            id_thread: u32,
+            dw_flags: u32,
+        ) -> isize;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetCurrentProcessId() -> u32;
+        pub fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> isize;
+        pub fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        pub fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
+        pub fn CloseHandle(handle: isize) -> i32;
     }
 }
 
@@ -1034,6 +1152,193 @@ fn apply_tool_window_style(wdw: &tauri::WebviewWindow) {
 }
 
 #[cfg(windows)]
+fn window_pid(hwnd: isize) -> u32 {
+    let mut pid = 0u32;
+    unsafe {
+        win32::GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    pid
+}
+
+#[cfg(windows)]
+fn window_class(hwnd: isize) -> String {
+    let mut buf = [0u16; 256];
+    let n = unsafe { win32::GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if n <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..n as usize])
+}
+
+#[cfg(windows)]
+fn is_visible_toplevel(hwnd: isize) -> bool {
+    unsafe {
+        win32::IsWindow(hwnd) != 0
+            && win32::IsWindowVisible(hwnd) != 0
+            && win32::GetAncestor(hwnd, 2) == hwnd
+    }
+}
+
+#[cfg(windows)]
+fn foreground_is_ours() -> bool {
+    unsafe {
+        let fg = win32::GetForegroundWindow();
+        fg != 0 && window_pid(fg) == win32::GetCurrentProcessId()
+    }
+}
+
+#[cfg(windows)]
+fn picker_is_showing() -> bool {
+    let hwnd = PICKER_HWND.load(Ordering::SeqCst);
+    hwnd != 0 && is_visible_toplevel(hwnd)
+}
+
+#[cfg(windows)]
+fn parent_pid(pid: u32) -> Option<u32> {
+    unsafe {
+        let snap = win32::CreateToolhelp32Snapshot(0x2, 0);
+        if snap == 0 || snap == -1 {
+            return None;
+        }
+        let mut entry = std::mem::zeroed::<win32::ProcessEntry32W>();
+        entry.dw_size = std::mem::size_of::<win32::ProcessEntry32W>() as u32;
+        let mut found = None;
+        if win32::Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32_process_id == pid {
+                    found = Some(entry.th32_parent_process_id);
+                    break;
+                }
+                if win32::Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        win32::CloseHandle(snap);
+        found
+    }
+}
+
+#[cfg(windows)]
+fn lift_foreign_dialog(hwnd: isize) {
+    PICKER_HWND.store(hwnd, Ordering::SeqCst);
+    let main = MAIN_HWND.load(Ordering::SeqCst);
+    const HWND_TOPMOST: isize = -1;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    const GWLP_HWNDPARENT: i32 = -8;
+    unsafe {
+        win32::AllowSetForegroundWindow(0xFFFF_FFFF);
+        if main != 0 {
+            win32::SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, main);
+        }
+        win32::SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW,
+        );
+        win32::BringWindowToTop(hwnd);
+        win32::SetForegroundWindow(hwnd);
+    }
+}
+
+#[cfg(windows)]
+fn consider_lift(hwnd: isize, allow_tree_walk: bool) {
+    if hwnd == 0 || !is_visible_toplevel(hwnd) {
+        return;
+    }
+    let wpid = window_pid(hwnd);
+    let ours = unsafe { win32::GetCurrentProcessId() };
+    if wpid == ours {
+        return;
+    }
+    let class = window_class(hwnd);
+    let in_tree = allow_tree_walk && {
+        let root = DSH_ROOT_PID.load(Ordering::SeqCst);
+        root != 0 && pid_is_under_root_with(wpid, root, parent_pid)
+    };
+    if !should_lift_foreign_window(
+        &class,
+        wpid,
+        ours,
+        in_tree,
+        foreground_is_ours(),
+        true,
+    ) {
+        return;
+    }
+    lift_foreign_dialog(hwnd);
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_lift_proc(hwnd: isize, _lparam: isize) -> i32 {
+    consider_lift(hwnd, false);
+    1
+}
+
+#[cfg(windows)]
+fn scan_and_lift_pickers() {
+    let hwnd = PICKER_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 && is_visible_toplevel(hwnd) {
+        lift_foreign_dialog(hwnd);
+        return;
+    }
+    if hwnd != 0 {
+        PICKER_HWND.store(0, Ordering::SeqCst);
+    }
+    unsafe {
+        win32::EnumWindows(enum_lift_proc, 0);
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn on_win_event(
+    _hook: isize,
+    event: u32,
+    hwnd: isize,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    const OBJID_WINDOW: i32 = 0;
+    const EVENT_SYSTEM_DIALOGSTART: u32 = 0x0010;
+    const EVENT_OBJECT_DESTROY: u32 = 0x8001;
+    const EVENT_OBJECT_SHOW: u32 = 0x8002;
+    const EVENT_OBJECT_HIDE: u32 = 0x8003;
+    if id_object != OBJID_WINDOW || hwnd == 0 {
+        return;
+    }
+    if event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY {
+        if PICKER_HWND.load(Ordering::SeqCst) == hwnd {
+            PICKER_HWND.store(0, Ordering::SeqCst);
+        }
+        return;
+    }
+    if event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_DIALOGSTART {
+        consider_lift(hwnd, true);
+    }
+}
+
+#[cfg(windows)]
+fn install_dialog_zorder_hook() {
+    unsafe {
+        win32::SetWinEventHook(0x8001, 0x8003, 0, on_win_event, 0, 0, 0);
+        win32::SetWinEventHook(0x0010, 0x0010, 0, on_win_event, 0, 0, 0);
+    }
+}
+
+#[cfg(windows)]
+fn remember_main_hwnd(hwnd: isize) {
+    MAIN_HWND.store(hwnd, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
 fn raise_win32(wdw: &tauri::WebviewWindow) {
     let Ok(hwnd) = wdw.hwnd() else {
         return;
@@ -1041,6 +1346,7 @@ fn raise_win32(wdw: &tauri::WebviewWindow) {
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_NOOWNERZORDER: u32 = 0x0200;
     unsafe {
         win32::SetWindowPos(
             hwnd.0 as isize,
@@ -1049,7 +1355,7 @@ fn raise_win32(wdw: &tauri::WebviewWindow) {
             0,
             0,
             0,
-            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
         );
     }
 }
@@ -1096,6 +1402,13 @@ fn handle_main_minimize_event(app: &AppHandle, is_minimized: bool) {
 fn raise_overlay(app: AppHandle, label: String) {
     if !overlays_allowed(&app) {
         return;
+    }
+    #[cfg(windows)]
+    {
+        scan_and_lift_pickers();
+        if !allow_overlay_z_raise(picker_is_showing(), foreground_is_ours()) {
+            return;
+        }
     }
     let Some(wdw) = app.get_webview_window(&label) else {
         return;
@@ -1221,7 +1534,16 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() {
-    tauri::Builder::default()
+    // Must be the first plugin: a second exe would also spawn `dsh web` on
+    // port 3080 and fight the existing Node process.
+    let mut builder = tauri::Builder::default();
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            restore_from_tray(app);
+        }));
+    }
+    builder
         .manage(ServerState { pid: Mutex::new(None) })
         .manage(ShellState {
             minimized: AtomicBool::new(false),
@@ -1243,13 +1565,26 @@ fn main() {
         .setup(|app| {
             #[cfg(windows)]
             mark_elevated_title(app);
+            #[cfg(windows)]
+            {
+                if let Some(main) = app.get_webview_window("main") {
+                    if let Ok(hwnd) = main.hwnd() {
+                        remember_main_hwnd(hwnd.0 as isize);
+                    }
+                }
+                install_dialog_zorder_hook();
+            }
             setup_tray(app)
         })
         .on_window_event(|window, event| {
             #[cfg(windows)]
-            if matches!(window.label(), "dsh" | "chrome-btn") {
-                if let Ok(hwnd) = window.hwnd() {
-                    apply_tool_window_hwnd(hwnd.0 as isize);
+            if let Ok(hwnd) = window.hwnd() {
+                let hwnd = hwnd.0 as isize;
+                if window.label() == "main" {
+                    remember_main_hwnd(hwnd);
+                }
+                if matches!(window.label(), "dsh" | "chrome-btn") {
+                    apply_tool_window_hwnd(hwnd);
                 }
             }
             match event {
@@ -1275,15 +1610,21 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
-                let state = app_handle.state::<ServerState>();
-                let pid = {
-                    let mut guard = state.pid.lock().unwrap();
-                    guard.take()
-                };
-                if let Some(pid) = pid {
-                    kill_process_group(pid);
+            match event {
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => restore_from_tray(app_handle),
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                    let state = app_handle.state::<ServerState>();
+                    let pid = {
+                        let mut guard = state.pid.lock().unwrap();
+                        guard.take()
+                    };
+                    remember_dsh_root_pid(None);
+                    if let Some(pid) = pid {
+                        kill_process_group(pid);
+                    }
                 }
+                _ => {}
             }
         });
 }
@@ -1339,6 +1680,46 @@ mod tests {
         let res = "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\nupgrade required";
         assert!(looks_like_dsh_api(res.as_bytes()));
         assert!(!looks_like_dsh_api(b"HTTP/1.1 404 Not Found\r\n\r\n"));
+    }
+
+    #[test]
+    fn web_launch_passes_no_open() {
+        assert_eq!(DSH_WEB_ARGS[0], "web");
+        assert!(
+            DSH_WEB_ARGS.contains(&"--no-open"),
+            "dsh web --no-open is the public switch that skips the default browser"
+        );
+    }
+
+    #[test]
+    fn pid_is_under_root_walks_ancestors() {
+        let parent_of = |pid: u32| match pid {
+            30 => Some(20),
+            20 => Some(10),
+            10 => Some(1),
+            _ => None,
+        };
+        assert!(pid_is_under_root_with(30, 10, parent_of));
+        assert!(pid_is_under_root_with(10, 10, parent_of));
+        assert!(!pid_is_under_root_with(30, 99, parent_of));
+        assert!(!pid_is_under_root_with(1, 10, parent_of));
+    }
+
+    #[test]
+    fn overlay_z_raise_yields_to_foreign_picker_and_other_apps() {
+        assert!(allow_overlay_z_raise(false, true));
+        assert!(!allow_overlay_z_raise(true, true));
+        assert!(!allow_overlay_z_raise(false, false));
+        assert!(!allow_overlay_z_raise(true, false));
+    }
+
+    #[test]
+    fn lift_dsh_worker_dialogs_but_not_our_own_windows() {
+        assert!(!should_lift_foreign_window("#32770", 1, 1, false, true, true));
+        assert!(!should_lift_foreign_window("#32770", 9, 1, false, true, false));
+        assert!(should_lift_foreign_window("#32770", 9, 1, false, true, true));
+        assert!(should_lift_foreign_window("Chrome_WidgetWin_1", 9, 1, true, false, true));
+        assert!(!should_lift_foreign_window("Chrome_WidgetWin_1", 9, 1, false, true, true));
     }
 
     #[test]
