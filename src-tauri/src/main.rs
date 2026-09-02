@@ -60,6 +60,15 @@ fn allow_overlay_z_raise(picker_showing: bool, foreground_is_ours: bool) -> bool
     !picker_showing && foreground_is_ours
 }
 
+/// Only ever a native dialog, never just "a window the harness owns".
+///
+/// `#32770` is the class every `IFileOpenDialog` carries — but plenty of
+/// unrelated resident apps (Internet Download Manager, for one) also give
+/// their main window that class, so a lift is additionally restricted to
+/// windows that just appeared, which is what the WinEvent hook reports.
+/// Matching on ownership alone used to promote any harness-tree window, and
+/// matching a long-lived foreign `#32770` used to hand it the foreground and
+/// pull the caret out of the Harness composer.
 fn should_lift_foreign_window(
     class: &str,
     window_pid: u32,
@@ -68,13 +77,10 @@ fn should_lift_foreign_window(
     foreground_is_ours: bool,
     is_visible_toplevel: bool,
 ) -> bool {
-    if !is_visible_toplevel || window_pid == our_pid {
+    if !is_visible_toplevel || window_pid == our_pid || class != "#32770" {
         return false;
     }
-    if in_dsh_tree {
-        return true;
-    }
-    class == "#32770" && foreground_is_ours
+    in_dsh_tree || foreground_is_ours
 }
 
 /// How to keep a foreign folder picker above Tauri without aborting it.
@@ -89,6 +95,7 @@ struct ForeignDialogLiftPlan {
     disable_main: bool,
     restack_topmost: bool,
     show_window: bool,
+    set_foreground: bool,
 }
 
 fn foreign_dialog_lift_plan(
@@ -101,6 +108,9 @@ fn foreign_dialog_lift_plan(
         disable_main: false,
         restack_topmost: restack,
         show_window: restack && !already_tracked,
+        // Take the foreground once, as the dialog appears. A second grab would
+        // yank focus back out of whatever the user has clicked since.
+        set_foreground: !already_tracked,
     }
 }
 
@@ -1273,6 +1283,10 @@ const INJECT_WIDE_CHAT_JS: &str = r#"
 "#;
 
 /// Widen the Conversation tab past Harness's 748px content cap.
+///
+/// Ctrl +/-/0 zoom is deliberately not bound here: `zoomHotkeysEnabled` leaves
+/// WebView2's `IsZoomControlEnabled` and browser accelerator keys on, so the
+/// runtime already handles those keys whenever this webview holds focus.
 #[tauri::command]
 fn inject_dsh_desktop_css(app: AppHandle) {
     let Some(wdw) = app.get_webview_window("dsh") else {
@@ -1324,10 +1338,6 @@ mod win32 {
         pub fn SetForegroundWindow(hwnd: isize) -> i32;
         pub fn BringWindowToTop(hwnd: isize) -> i32;
         pub fn AllowSetForegroundWindow(process_id: u32) -> i32;
-        pub fn EnumWindows(
-            lp_enum_func: unsafe extern "system" fn(isize, isize) -> i32,
-            l_param: isize,
-        ) -> i32;
         pub fn SetWinEventHook(
             event_min: u32,
             event_max: u32,
@@ -1487,6 +1497,7 @@ fn lift_foreign_dialog(hwnd: isize) {
     const HWND_TOPMOST: isize = -1;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_SHOWWINDOW: u32 = 0x0040;
     unsafe {
         win32::AllowSetForegroundWindow(0xFFFF_FFFF);
@@ -1497,14 +1508,22 @@ fn lift_foreign_dialog(hwnd: isize) {
         if plan.show_window {
             flags |= SWP_SHOWWINDOW;
         }
+        if !plan.set_foreground {
+            flags |= SWP_NOACTIVATE;
+        }
         win32::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
-        win32::BringWindowToTop(hwnd);
-        win32::SetForegroundWindow(hwnd);
+        // Both of these activate a top-level window, so a re-lift restacks and
+        // stops there.
+        if plan.set_foreground {
+            win32::BringWindowToTop(hwnd);
+            win32::SetForegroundWindow(hwnd);
+        }
     }
 }
 
+/// Called only for windows the WinEvent hook has just seen appear.
 #[cfg(windows)]
-fn consider_lift(hwnd: isize, allow_tree_walk: bool) {
+fn consider_lift(hwnd: isize) {
     if hwnd == 0 || !is_visible_toplevel(hwnd) {
         return;
     }
@@ -1514,7 +1533,7 @@ fn consider_lift(hwnd: isize, allow_tree_walk: bool) {
         return;
     }
     let class = window_class(hwnd);
-    let in_tree = allow_tree_walk && {
+    let in_tree = {
         let root = DSH_ROOT_PID.load(Ordering::SeqCst);
         root != 0 && pid_is_under_root_with(wpid, root, parent_pid)
     };
@@ -1529,27 +1548,6 @@ fn consider_lift(hwnd: isize, allow_tree_walk: bool) {
         return;
     }
     lift_foreign_dialog(hwnd);
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn enum_lift_proc(hwnd: isize, _lparam: isize) -> i32 {
-    consider_lift(hwnd, false);
-    1
-}
-
-#[cfg(windows)]
-fn scan_and_lift_pickers() {
-    let hwnd = PICKER_HWND.load(Ordering::SeqCst);
-    if hwnd != 0 && is_visible_toplevel(hwnd) {
-        lift_foreign_dialog(hwnd);
-        return;
-    }
-    if hwnd != 0 {
-        clear_lifted_picker();
-    }
-    unsafe {
-        win32::EnumWindows(enum_lift_proc, 0);
-    }
 }
 
 #[cfg(windows)]
@@ -1577,7 +1575,7 @@ unsafe extern "system" fn on_win_event(
         return;
     }
     if event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_DIALOGSTART {
-        consider_lift(hwnd, true);
+        consider_lift(hwnd);
     }
 }
 
@@ -1654,12 +1652,12 @@ fn raise_overlay(app: AppHandle, label: String) {
     if !overlays_allowed(&app) {
         return;
     }
+    // Reached on every focus change of the Harness webview, so it only reads
+    // window state: rescanning the desktop for dialogs to lift from here is
+    // what stole the caret out of the composer.
     #[cfg(windows)]
-    {
-        scan_and_lift_pickers();
-        if !allow_overlay_z_raise(picker_is_showing(), foreground_is_ours()) {
-            return;
-        }
+    if !allow_overlay_z_raise(picker_is_showing(), foreground_is_ours()) {
+        return;
     }
     let Some(wdw) = app.get_webview_window(&label) else {
         return;
@@ -2127,8 +2125,15 @@ mod tests {
         assert!(!should_lift_foreign_window("#32770", 1, 1, false, true, true));
         assert!(!should_lift_foreign_window("#32770", 9, 1, false, true, false));
         assert!(should_lift_foreign_window("#32770", 9, 1, false, true, true));
-        assert!(should_lift_foreign_window("Chrome_WidgetWin_1", 9, 1, true, false, true));
-        assert!(!should_lift_foreign_window("Chrome_WidgetWin_1", 9, 1, false, true, true));
+        assert!(should_lift_foreign_window("#32770", 9, 1, true, false, true));
+        assert!(
+            !should_lift_foreign_window("Qt682QTQWindowIcon", 9, 1, true, false, true),
+            "an IDA window under the harness tree is not a picker"
+        );
+        assert!(
+            !should_lift_foreign_window("Chrome_WidgetWin_1", 9, 1, false, true, true),
+            "only the dialog class is ever a folder picker"
+        );
     }
 
     #[test]
@@ -2144,6 +2149,7 @@ mod tests {
         );
         assert!(first.restack_topmost);
         assert!(first.show_window);
+        assert!(first.set_foreground);
 
         let already_front = foreign_dialog_lift_plan(true, true);
         assert!(!already_front.assign_owner);
@@ -2158,6 +2164,10 @@ mod tests {
         assert!(
             !lost_focus.show_window,
             "re-ShowWindow on a live modal dialog can dismiss it"
+        );
+        assert!(
+            !lost_focus.set_foreground,
+            "re-grabbing the foreground is what pulled the caret out of the composer"
         );
     }
 
