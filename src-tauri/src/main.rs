@@ -77,6 +77,33 @@ fn should_lift_foreign_window(
     class == "#32770" && foreground_is_ours
 }
 
+/// How to keep a foreign folder picker above Tauri without aborting it.
+///
+/// Harness `IFileOpenDialog::Show(NULL)` is already blocking in a Node child.
+/// Reparenting (`GWLP_HWNDPARENT`) or `EnableWindow(FALSE)` on the foreground
+/// shell mid-Show cancels that modal loop (`HRESULT_CANCELLED` → pick returns
+/// null → composer stays a "choose workspace" trigger).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForeignDialogLiftPlan {
+    assign_owner: bool,
+    disable_main: bool,
+    restack_topmost: bool,
+    show_window: bool,
+}
+
+fn foreign_dialog_lift_plan(
+    already_tracked: bool,
+    dialog_is_foreground: bool,
+) -> ForeignDialogLiftPlan {
+    let restack = !(already_tracked && dialog_is_foreground);
+    ForeignDialogLiftPlan {
+        assign_owner: false,
+        disable_main: false,
+        restack_topmost: restack,
+        show_window: restack && !already_tracked,
+    }
+}
+
 fn remember_dsh_root_pid(pid: Option<u32>) {
     #[cfg(windows)]
     DSH_ROOT_PID.store(pid.unwrap_or(0), Ordering::SeqCst);
@@ -100,6 +127,30 @@ struct ShellState {
 }
 
 const OWNED_OVERLAY_LABELS: [&str; 2] = ["dsh", "chrome-btn"];
+
+fn persist_window_state_for(label: &str) -> bool {
+    label == "main"
+}
+
+/// Tray commands. The toolbar entry is the escape hatch for a floating button
+/// that failed to surface: without it the CLI log tab is unreachable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayAction {
+    ShowChrome,
+    Quit,
+    None,
+}
+
+const TRAY_SHOW_CHROME_ID: &str = "show-chrome";
+const TRAY_QUIT_ID: &str = "quit";
+
+fn tray_menu_action(id: &str) -> TrayAction {
+    match id {
+        TRAY_SHOW_CHROME_ID => TrayAction::ShowChrome,
+        TRAY_QUIT_ID => TrayAction::Quit,
+        _ => TrayAction::None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MinimizeTransition {
@@ -1233,8 +1284,6 @@ fn inject_dsh_desktop_css(app: AppHandle) {
 #[cfg(windows)]
 static DSH_ROOT_PID: AtomicU32 = AtomicU32::new(0);
 #[cfg(windows)]
-static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
-#[cfg(windows)]
 static PICKER_HWND: AtomicIsize = AtomicIsize::new(0);
 
 #[cfg(windows)]
@@ -1266,7 +1315,6 @@ mod win32 {
         ) -> i32;
         pub fn GetWindowLongW(hwnd: isize, n_index: i32) -> i32;
         pub fn SetWindowLongW(hwnd: isize, n_index: i32, dw_new_long: i32) -> i32;
-        pub fn SetWindowLongPtrW(hwnd: isize, n_index: i32, dw_new_long: isize) -> isize;
         pub fn GetClassNameW(hwnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
         pub fn GetWindowThreadProcessId(hwnd: isize, lpdw_process_id: *mut u32) -> u32;
         pub fn GetForegroundWindow() -> isize;
@@ -1424,28 +1472,32 @@ fn parent_pid(pid: u32) -> Option<u32> {
 }
 
 #[cfg(windows)]
+fn clear_lifted_picker() {
+    PICKER_HWND.store(0, Ordering::SeqCst);
+}
+
+/// Keep the Node-hosted `IFileOpenDialog` above Tauri without owning or disabling it.
+#[cfg(windows)]
 fn lift_foreign_dialog(hwnd: isize) {
+    let already = PICKER_HWND.load(Ordering::SeqCst) == hwnd;
     PICKER_HWND.store(hwnd, Ordering::SeqCst);
-    let main = MAIN_HWND.load(Ordering::SeqCst);
+    let foreground = unsafe { win32::GetForegroundWindow() } == hwnd;
+    let plan = foreign_dialog_lift_plan(already, foreground);
+    debug_assert!(!plan.assign_owner && !plan.disable_main);
     const HWND_TOPMOST: isize = -1;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_SHOWWINDOW: u32 = 0x0040;
-    const GWLP_HWNDPARENT: i32 = -8;
     unsafe {
         win32::AllowSetForegroundWindow(0xFFFF_FFFF);
-        if main != 0 {
-            win32::SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, main);
+        if !plan.restack_topmost {
+            return;
         }
-        win32::SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW,
-        );
+        let mut flags = SWP_NOSIZE | SWP_NOMOVE;
+        if plan.show_window {
+            flags |= SWP_SHOWWINDOW;
+        }
+        win32::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
         win32::BringWindowToTop(hwnd);
         win32::SetForegroundWindow(hwnd);
     }
@@ -1493,7 +1545,7 @@ fn scan_and_lift_pickers() {
         return;
     }
     if hwnd != 0 {
-        PICKER_HWND.store(0, Ordering::SeqCst);
+        clear_lifted_picker();
     }
     unsafe {
         win32::EnumWindows(enum_lift_proc, 0);
@@ -1520,7 +1572,7 @@ unsafe extern "system" fn on_win_event(
     }
     if event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY {
         if PICKER_HWND.load(Ordering::SeqCst) == hwnd {
-            PICKER_HWND.store(0, Ordering::SeqCst);
+            clear_lifted_picker();
         }
         return;
     }
@@ -1535,11 +1587,6 @@ fn install_dialog_zorder_hook() {
         win32::SetWinEventHook(0x8001, 0x8003, 0, on_win_event, 0, 0, 0);
         win32::SetWinEventHook(0x0010, 0x0010, 0, on_win_event, 0, 0, 0);
     }
-}
-
-#[cfg(windows)]
-fn remember_main_hwnd(hwnd: isize) {
-    MAIN_HWND.store(hwnd, Ordering::SeqCst);
 }
 
 #[cfg(windows)]
@@ -1694,7 +1741,81 @@ fn hide_to_tray(app: &AppHandle) {
     }
 }
 
+/// Quitting is not instant: the harness gets one graceful signal, then up to
+/// `DSH_STOP_GRACE` to flush (this is where IDA writes its `*.i64`), then a
+/// forced kill. That wait must not run on the event loop, or the progress
+/// window put up to explain the delay would never paint.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+const QUIT_WINDOW_LABEL: &str = "quitting";
+
+/// True only for the click that owns the shutdown; later ones lose the race.
+fn claim_quit(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::SeqCst)
+}
+
+fn quitting() -> bool {
+    QUITTING.load(Ordering::SeqCst)
+}
+
+fn shutdown_dsh(app: &AppHandle) {
+    let pid = {
+        let state = app.state::<ServerState>();
+        let mut guard = state.pid.lock().unwrap();
+        guard.take()
+    };
+    remember_dsh_root_pid(None);
+    reset_server_ready(app);
+    if let Some(pid) = pid {
+        kill_process_group(pid);
+    }
+}
+
+fn show_quit_progress(app: &AppHandle) {
+    if app.get_webview_window(QUIT_WINDOW_LABEL).is_some() {
+        return;
+    }
+    let built = tauri::WebviewWindowBuilder::new(
+        app,
+        QUIT_WINDOW_LABEL,
+        tauri::WebviewUrl::App("quit.html".into()),
+    )
+    .title("正在退出 DSH Desktop")
+    // Tall enough that the subtitle wrapping to a second line — a different
+    // UI font or DPI is enough to cause it — still is not clipped.
+    .inner_size(420.0, 184.0)
+    .center()
+    .resizable(false)
+    .minimizable(false)
+    .maximizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .focused(true)
+    .build();
+    if let Ok(wdw) = built {
+        let _ = wdw.show();
+    }
+}
+
+/// Show the progress window before withdrawing the shell, so the screen is
+/// never empty between the click and the card.
+fn begin_quit(app: &AppHandle) {
+    if !claim_quit(&QUITTING) {
+        return;
+    }
+    show_quit_progress(app);
+    hide_to_tray(app);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        shutdown_dsh(&app);
+        app.exit(0);
+    });
+}
+
 fn restore_from_tray(app: &AppHandle) {
+    if quitting() {
+        return;
+    }
     app.state::<ShellState>()
         .withdrawn
         .store(false, Ordering::SeqCst);
@@ -1706,9 +1827,24 @@ fn restore_from_tray(app: &AppHandle) {
     let _ = app.emit("app:restore", ());
 }
 
+fn show_chrome_from_tray(app: &AppHandle) {
+    if quitting() {
+        return;
+    }
+    restore_from_tray(app);
+    let _ = app.emit("chrome:show", ());
+}
+
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&quit])?;
+    let show_chrome = MenuItem::with_id(
+        app,
+        TRAY_SHOW_CHROME_ID,
+        "显示工具栏（CLI 日志）",
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(app, TRAY_QUIT_ID, "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_chrome, &quit])?;
     let icon = app
         .default_window_icon()
         .cloned()
@@ -1718,10 +1854,10 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .tooltip("DSH Desktop")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| {
-            if event.id.as_ref() == "quit" {
-                app.exit(0);
-            }
+        .on_menu_event(|app, event| match tray_menu_action(event.id.as_ref()) {
+            TrayAction::ShowChrome => show_chrome_from_tray(app),
+            TrayAction::Quit => begin_quit(app),
+            TrayAction::None => {}
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -1746,6 +1882,16 @@ fn main() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             restore_from_tray(app);
         }));
+        builder = builder.plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .with_filter(persist_window_state_for)
+                .build(),
+        );
     }
     builder
         .manage(ServerState {
@@ -1775,12 +1921,11 @@ fn main() {
             mark_elevated_title(app);
             #[cfg(windows)]
             {
-                if let Some(main) = app.get_webview_window("main") {
-                    if let Ok(hwnd) = main.hwnd() {
-                        remember_main_hwnd(hwnd.0 as isize);
-                    }
-                }
                 install_dialog_zorder_hook();
+            }
+            // Created hidden so restore can apply size/position/maximized first.
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.show();
             }
             setup_tray(app)
         })
@@ -1788,9 +1933,6 @@ fn main() {
             #[cfg(windows)]
             if let Ok(hwnd) = window.hwnd() {
                 let hwnd = hwnd.0 as isize;
-                if window.label() == "main" {
-                    remember_main_hwnd(hwnd);
-                }
                 if matches!(window.label(), "dsh" | "chrome-btn") {
                     apply_tool_window_hwnd(hwnd);
                 }
@@ -1806,11 +1948,11 @@ fn main() {
                 }
                 tauri::WindowEvent::Resized(_)
                 | tauri::WindowEvent::Moved(_)
-                | tauri::WindowEvent::Focused(_) => {
-                    if window.label() == "main" {
-                        let minimized = window.is_minimized().unwrap_or(false);
-                        handle_main_minimize_event(window.app_handle(), minimized);
-                    }
+                | tauri::WindowEvent::Focused(_)
+                    if window.label() == "main" =>
+                {
+                    let minimized = window.is_minimized().unwrap_or(false);
+                    handle_main_minimize_event(window.app_handle(), minimized);
                 }
                 _ => {}
             }
@@ -1821,17 +1963,11 @@ fn main() {
             match event {
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => restore_from_tray(app_handle),
+                // A tray quit has already drained this off the event loop; any
+                // other exit path (OS shutdown, task manager close) still needs
+                // the tree stopped here.
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                    let state = app_handle.state::<ServerState>();
-                    let pid = {
-                        let mut guard = state.pid.lock().unwrap();
-                        guard.take()
-                    };
-                    remember_dsh_root_pid(None);
-                    reset_server_ready(app_handle);
-                    if let Some(pid) = pid {
-                        kill_process_group(pid);
-                    }
+                    shutdown_dsh(app_handle)
                 }
                 _ => {}
             }
@@ -1996,6 +2132,36 @@ mod tests {
     }
 
     #[test]
+    fn picker_lift_never_reparents_or_disables_a_dialog_already_in_show() {
+        let first = foreign_dialog_lift_plan(false, false);
+        assert!(
+            !first.assign_owner,
+            "GWLP_HWNDPARENT mid-Show cancels the native picker"
+        );
+        assert!(
+            !first.disable_main,
+            "EnableWindow(FALSE) on the shell also cancels Show(NULL)"
+        );
+        assert!(first.restack_topmost);
+        assert!(first.show_window);
+
+        let already_front = foreign_dialog_lift_plan(true, true);
+        assert!(!already_front.assign_owner);
+        assert!(!already_front.disable_main);
+        assert!(!already_front.restack_topmost);
+        assert!(!already_front.show_window);
+
+        let lost_focus = foreign_dialog_lift_plan(true, false);
+        assert!(!lost_focus.assign_owner);
+        assert!(!lost_focus.disable_main);
+        assert!(lost_focus.restack_topmost);
+        assert!(
+            !lost_focus.show_window,
+            "re-ShowWindow on a live modal dialog can dismiss it"
+        );
+    }
+
+    #[test]
     fn minimize_transition_only_fires_on_edge() {
         assert_eq!(
             minimize_transition(false, false),
@@ -2025,6 +2191,37 @@ mod tests {
         );
         assert!(should_show_owned_overlay(false, true));
         assert_eq!(OWNED_OVERLAY_LABELS, ["dsh", "chrome-btn"]);
+    }
+
+    #[test]
+    fn only_the_first_quit_click_owns_the_shutdown() {
+        let flag = AtomicBool::new(false);
+        assert!(claim_quit(&flag));
+        assert!(!claim_quit(&flag), "a second click must not stop dsh twice");
+    }
+
+    #[test]
+    fn quit_progress_window_is_neither_overlay_nor_persisted() {
+        assert!(!persist_window_state_for(QUIT_WINDOW_LABEL));
+        assert!(
+            !OWNED_OVERLAY_LABELS.contains(&QUIT_WINDOW_LABEL),
+            "withdrawing the shell would hide the progress window with it"
+        );
+    }
+
+    #[test]
+    fn tray_offers_a_toolbar_escape_hatch_next_to_quit() {
+        assert_eq!(tray_menu_action(TRAY_SHOW_CHROME_ID), TrayAction::ShowChrome);
+        assert_eq!(tray_menu_action(TRAY_QUIT_ID), TrayAction::Quit);
+        assert_eq!(tray_menu_action("whatever"), TrayAction::None);
+    }
+
+    #[test]
+    fn window_state_tracks_only_the_main_shell() {
+        assert!(persist_window_state_for("main"));
+        for label in OWNED_OVERLAY_LABELS {
+            assert!(!persist_window_state_for(label));
+        }
     }
 
     #[test]

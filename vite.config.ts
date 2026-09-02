@@ -19,6 +19,7 @@ export default defineConfig({
       input: {
         main: resolve(root, "index.html"),
         "chrome-btn": resolve(root, "chrome-btn.html"),
+        quit: resolve(root, "quit.html"),
       },
     },
   },
