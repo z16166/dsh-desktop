@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(windows, feature(windows_process_extensions_show_window))]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -23,6 +24,23 @@ const PORT: u16 = 3080;
 /// Public `dsh web` argv. `--no-open` is the documented flag that disables
 /// opening the default browser after the Web UI binds.
 const DSH_WEB_ARGS: &[&str] = &["web", "--no-open"];
+
+/// Harness prints `dsh web: http://127.0.0.1:3080/?token=...` once the Loader
+/// tree has settled. That line is the public ready signal; GET `/` without the
+/// token now returns 401, so HTTP probing alone no longer works.
+fn parse_dsh_web_url(line: &str) -> Option<String> {
+    let idx = line.find("dsh web:")?;
+    let rest = line[idx + "dsh web:".len()..].trim();
+    if rest.starts_with("opening the default browser") {
+        return None;
+    }
+    let url = rest.split_whitespace().next()?;
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
 
 fn pid_is_under_root_with(pid: u32, root: u32, parent_of: impl Fn(u32) -> Option<u32>) -> bool {
     let mut current = pid;
@@ -72,6 +90,8 @@ fn url() -> String {
 
 struct ServerState {
     pid: Mutex<Option<u32>>,
+    launch_url: Mutex<String>,
+    ready: AtomicBool,
 }
 
 struct ShellState {
@@ -144,11 +164,40 @@ struct Status {
 }
 
 fn status_of(app: &AppHandle, running: bool) -> Status {
+    let launch_url = app
+        .state::<ServerState>()
+        .launch_url
+        .lock()
+        .ok()
+        .map(|g| g.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(url);
     Status {
         running,
         port: PORT,
-        url: url(),
+        url: launch_url,
         source: load_settings(app).source,
+    }
+}
+
+fn emit_server_ready(app: &AppHandle, launch_url: &str) {
+    let state = app.state::<ServerState>();
+    {
+        let mut guard = state.launch_url.lock().unwrap();
+        *guard = launch_url.to_string();
+    }
+    if state.ready.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.emit("server:ready", launch_url);
+}
+
+fn reset_server_ready(app: &AppHandle) {
+    let state = app.state::<ServerState>();
+    state.ready.store(false, Ordering::SeqCst);
+    {
+        let mut guard = state.launch_url.lock().unwrap();
+        *guard = url();
     }
 }
 
@@ -383,11 +432,25 @@ fn base_tool_cmd(tool: &str) -> Command {
     c
 }
 
-/// Windows: keep the child console hidden so no cmd window flashes up.
+/// Windows: keep helper consoles hidden (git / pnpm / taskkill).
 #[cfg(windows)]
 fn hide_console(c: &mut Command) {
     use std::os::windows::process::CommandExt;
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+
+/// Hidden console that can still receive Ctrl+C.
+///
+/// `CREATE_NO_WINDOW` leaves Node with no console, so the only stop left is
+/// `taskkill /T /F`. That tears down IDA MCP in-process and can corrupt `*.i64`.
+/// `CREATE_NEW_CONSOLE` + `SW_HIDE` keeps a console we can AttachConsole to.
+#[cfg(windows)]
+fn hide_dsh_console(c: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+    const SW_HIDE: u16 = 0;
+    c.creation_flags(CREATE_NEW_CONSOLE);
+    c.show_window(SW_HIDE);
 }
 
 /// Windows: GUI-launched processes may inherit a stale PATH (Node.js not
@@ -421,11 +484,16 @@ fn dsh_command(settings: &AppSettings) -> Result<Command, String> {
             let mut c = base_tool_cmd("npx");
             c.args(["--yes", "@deepseek-ai/dsh"]);
             c.args(DSH_WEB_ARGS);
+            #[cfg(windows)]
+            hide_dsh_console(&mut c);
             Ok(c)
         }
         LaunchSource::Local => {
             let dir = validate_local_repo(&settings.local_path)?;
-            local_dsh_command(&dir, DSH_WEB_ARGS)
+            let mut c = local_dsh_command(&dir, DSH_WEB_ARGS)?;
+            #[cfg(windows)]
+            hide_dsh_console(&mut c);
+            Ok(c)
         }
     }
 }
@@ -541,6 +609,11 @@ fn looks_like_dsh_index(buf: &[u8]) -> bool {
     status_ok && text.contains("__DSH_BOOT__")
 }
 
+fn looks_like_unauthorized(buf: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(buf);
+    text.starts_with("HTTP/1.1 401") || text.starts_with("HTTP/1.0 401")
+}
+
 /// `/api/events.host` returns 426 once the connection plugin has mounted.
 fn looks_like_dsh_api(buf: &[u8]) -> bool {
     let text = String::from_utf8_lossy(buf);
@@ -586,15 +659,20 @@ fn spawn_readiness_poller(app: AppHandle, require_owned: bool) {
     std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
+            if app.state::<ServerState>().ready.load(Ordering::SeqCst) {
+                return;
+            }
             if is_web_ready(PORT) {
-                let _ = app.emit("server:ready", ());
+                emit_server_ready(&app, &url());
                 return;
             }
             if require_owned && app.state::<ServerState>().pid.lock().unwrap().is_none() {
                 return;
             }
             if Instant::now() >= deadline {
-                let _ = app.emit("server:timeout", ());
+                if !app.state::<ServerState>().ready.load(Ordering::SeqCst) {
+                    let _ = app.emit("server:timeout", ());
+                }
                 return;
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -602,19 +680,107 @@ fn spawn_readiness_poller(app: AppHandle, require_owned: bool) {
     });
 }
 
-#[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
-    std::thread::sleep(Duration::from_millis(400));
-    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+/// Harness `PROCESS_SHUTDOWN_TIMEOUT_MS` is 5s. Wait longer so plugin dispose
+/// (IDA MCP flushing `*.i64`) can finish before we escalate to a tree kill.
+const DSH_STOP_GRACE: Duration = Duration::from_secs(8);
+
+fn dsh_tree_has_stopped(root_alive: bool, port_open: bool) -> bool {
+    !root_alive && !port_open
 }
 
-#[cfg(not(unix))]
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, 0) == 0
+    }
+    #[cfg(windows)]
+    unsafe {
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+        let handle = win32::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = win32::GetExitCodeProcess(handle, &mut code);
+        win32::CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn wait_for_dsh_stop(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if dsh_tree_has_stopped(process_is_alive(pid), is_port_open(PORT)) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return dsh_tree_has_stopped(process_is_alive(pid), is_port_open(PORT));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(windows)]
+fn send_ctrl_c(pid: u32) -> bool {
+    unsafe {
+        // Debug `cargo run` attaches a console; AttachConsole fails until we drop it.
+        let _ = win32::FreeConsole();
+        if win32::AttachConsole(pid) == 0 {
+            return false;
+        }
+        // Ignore the Ctrl+C we are about to generate, or this process exits too.
+        win32::SetConsoleCtrlHandler(None, 1);
+        let sent = win32::GenerateConsoleCtrlEvent(0, 0) != 0;
+        std::thread::sleep(Duration::from_millis(150));
+        let _ = win32::FreeConsole();
+        win32::SetConsoleCtrlHandler(None, 0);
+        sent
+    }
+}
+
+fn request_graceful_stop(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        // Signal the supervisor only. `kill(-pid, SIGTERM)` would also hit
+        // MCP children (IDA) at the same moment and skip harness dispose.
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = send_ctrl_c(pid);
+    }
+}
+
+fn force_kill_tree(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("taskkill");
+        c.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        hide_console(&mut c);
+        let _ = c.status();
+    }
+}
+
 fn kill_process_group(pid: u32) {
-    let mut c = Command::new("taskkill");
-    c.args(["/PID", &pid.to_string(), "/T", "/F"]);
-    hide_console(&mut c);
-    let _ = c.status();
+    // One SIGTERM/Ctrl+C only, then wait. A second signal makes harness
+    // force-exit and skip plugin dispose (the path that closes IDA cleanly).
+    // Unix and Windows share DSH_STOP_GRACE; do not SIGKILL after a short sleep.
+    request_graceful_stop(pid);
+    if wait_for_dsh_stop(pid, DSH_STOP_GRACE) {
+        return;
+    }
+    force_kill_tree(pid);
+    let _ = wait_for_dsh_stop(pid, Duration::from_secs(2));
 }
 
 fn pipe_lines<R: std::io::Read + Send + 'static>(
@@ -628,6 +794,11 @@ fn pipe_lines<R: std::io::Read + Send + 'static>(
             match line {
                 Ok(l) => {
                     let _ = app.emit(event, &l);
+                    if event == "server:stdout" {
+                        if let Some(launch_url) = parse_dsh_web_url(&l) {
+                            emit_server_ready(&app, &launch_url);
+                        }
+                    }
                     if let Some(buf) = &collected {
                         buf.lock().unwrap().push(l);
                     }
@@ -646,15 +817,22 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
         }
     }
 
-    // Port already serving a fully-booted dsh (e.g. a browser session)?
-    // Reuse it instead of spawning a duplicate that would fail with EADDRINUSE.
-    // TCP-only is not enough: dsh binds immediately and 404s until the
-    // frontend plugin mounts, which is what used to white-screen the iframe.
+    reset_server_ready(app);
+
+    // Port already serving a fully-booted dsh that still allows unauthenticated
+    // index reads (pre-token builds). Token-gated servers print `dsh web:` with
+    // `?token=` instead; HTTP GET `/` is 401 and cannot be reused.
     if is_web_ready(PORT) {
-        let _ = app.emit("server:ready", ());
+        emit_server_ready(app, &url());
         return Ok(status_of(app, true));
     }
     if is_port_open(PORT) {
+        let index = http_get(PORT, "/").unwrap_or_default();
+        if looks_like_unauthorized(&index) {
+            return Err(
+                "端口 3080 已被需要启动令牌的 dsh 占用，请先结束该 Node 进程后再启动".to_string(),
+            );
+        }
         spawn_readiness_poller(app.clone(), false);
         return Ok(status_of(app, true));
     }
@@ -705,6 +883,7 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
             *guard = None;
             drop(guard);
             remember_dsh_root_pid(None);
+            reset_server_ready(&app);
             let _ = app.emit("server:exited", code);
         });
     }
@@ -741,6 +920,7 @@ fn stop_server(app: AppHandle) -> Status {
         guard.take()
     };
     remember_dsh_root_pid(None);
+    reset_server_ready(&app);
     match pid {
         Some(pid) => {
             kill_process_group(pid);
@@ -1111,6 +1291,15 @@ mod win32 {
         pub fn Process32FirstW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
         pub fn Process32NextW(snapshot: isize, entry: *mut ProcessEntry32W) -> i32;
         pub fn CloseHandle(handle: isize) -> i32;
+        pub fn OpenProcess(desired_access: u32, inherit: i32, process_id: u32) -> isize;
+        pub fn GetExitCodeProcess(handle: isize, exit_code: *mut u32) -> i32;
+        pub fn AttachConsole(process_id: u32) -> i32;
+        pub fn FreeConsole() -> i32;
+        pub fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+        pub fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_group_id: u32) -> i32;
     }
 }
 
@@ -1544,7 +1733,11 @@ fn main() {
         }));
     }
     builder
-        .manage(ServerState { pid: Mutex::new(None) })
+        .manage(ServerState {
+            pid: Mutex::new(None),
+            launch_url: Mutex::new(url()),
+            ready: AtomicBool::new(false),
+        })
         .manage(ShellState {
             minimized: AtomicBool::new(false),
             withdrawn: AtomicBool::new(false),
@@ -1620,6 +1813,7 @@ fn main() {
                         guard.take()
                     };
                     remember_dsh_root_pid(None);
+                    reset_server_ready(app_handle);
                     if let Some(pid) = pid {
                         kill_process_group(pid);
                     }
@@ -1676,6 +1870,43 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_dsh_index_rejects_unauthorized_index() {
+        let res = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n";
+        assert!(!looks_like_dsh_index(res.as_bytes()));
+        assert!(looks_like_unauthorized(res.as_bytes()));
+    }
+
+    #[test]
+    fn parse_dsh_web_url_reads_token_launch_line() {
+        assert_eq!(
+            parse_dsh_web_url(
+                "dsh web: http://127.0.0.1:3080/?token=XlJCK6TjsP-MQci6fvrdyeINwpj2iiVQ9YM28zF6rgw"
+            ),
+            Some(
+                "http://127.0.0.1:3080/?token=XlJCK6TjsP-MQci6fvrdyeINwpj2iiVQ9YM28zF6rgw"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            parse_dsh_web_url(
+                "dsh web: http://127.0.0.1:4567/?token=test-token (LAN: http://192.168.1.5:4567/?token=test-token)"
+            ),
+            Some("http://127.0.0.1:4567/?token=test-token".to_string())
+        );
+        assert_eq!(
+            parse_dsh_web_url("dsh web: http://127.0.0.1:3080"),
+            Some("http://127.0.0.1:3080".to_string())
+        );
+        assert_eq!(
+            parse_dsh_web_url(
+                "dsh web: opening the default browser; pass --no-open to disable"
+            ),
+            None
+        );
+        assert!(parse_dsh_web_url("INFO:ida_pro_mcp.idalib_supervisor:Spawning").is_none());
+    }
+
+    #[test]
     fn looks_like_dsh_api_accepts_upgrade_required() {
         let res = "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\nupgrade required";
         assert!(looks_like_dsh_api(res.as_bytes()));
@@ -1688,6 +1919,18 @@ mod tests {
         assert!(
             DSH_WEB_ARGS.contains(&"--no-open"),
             "dsh web --no-open is the public switch that skips the default browser"
+        );
+    }
+
+    #[test]
+    fn dsh_stop_waits_until_root_and_port_are_gone() {
+        assert!(!dsh_tree_has_stopped(true, true));
+        assert!(!dsh_tree_has_stopped(false, true));
+        assert!(!dsh_tree_has_stopped(true, false));
+        assert!(dsh_tree_has_stopped(false, false));
+        assert!(
+            DSH_STOP_GRACE > Duration::from_secs(5),
+            "must outlast harness PROCESS_SHUTDOWN_TIMEOUT_MS so IDA can flush"
         );
     }
 

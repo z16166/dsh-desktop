@@ -6,7 +6,19 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 const PORT = 3080;
-const APP_URL = "http://127.0.0.1:" + PORT;
+const DEFAULT_APP_URL = "http://127.0.0.1:" + PORT;
+let appUrl = DEFAULT_APP_URL;
+
+function publicAppUrl(u: string): string {
+  try {
+    const parsed = new URL(u);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return u;
+  }
+}
 
 type LaunchSource = "npx" | "local";
 
@@ -316,7 +328,7 @@ async function showApp(): Promise<void> {
   if (!wdw) {
     const main = getCurrentWindow();
     wdw = new WebviewWindow(DSH_LABEL, {
-      url: APP_URL,
+      url: appUrl,
       parent: main,
       decorations: false,
       skipTaskbar: true,
@@ -383,8 +395,9 @@ async function stop(): Promise<void> {
   const s = await invoke<any>("stop_server");
   if (s.running) {
     appendLog("> 该服务非本应用启动，未停止", "sys");
-    setStatus("running", "运行中 · " + APP_URL);
+    setStatus("running", "运行中 · " + publicAppUrl(s.url || appUrl));
   } else {
+    appUrl = DEFAULT_APP_URL;
     setStatus("stopped", "已停止");
     await closeDshWindow();
   }
@@ -470,18 +483,22 @@ function setupTabs(): void {
 async function setupEvents(): Promise<void> {
   await listen<string>("server:stdout", (e) => appendLog(e.payload, "out"));
   await listen<string>("server:stderr", (e) => appendLog(e.payload, "err"));
-  await listen("server:ready", () => {
+  await listen<string>("server:ready", (e) => {
+    const next = (e.payload && String(e.payload).trim()) || DEFAULT_APP_URL;
     ready = true;
-    setStatus("running", "运行中 · " + APP_URL);
+    const urlChanged = next !== appUrl;
+    appUrl = next;
+    setStatus("running", "运行中 · " + publicAppUrl(appUrl));
     void (async () => {
+      if (urlChanged) await closeDshWindow();
       await showApp();
       if (!cliMode) hideChrome();
     })();
-    appendLog("> 就绪：" + APP_URL, "sys");
+    appendLog("> 就绪：" + publicAppUrl(appUrl), "sys");
     refreshDshVersion();
   });
   await listen("server:timeout", () => {
-    showStartupError("启动超时：90 秒内未检测到端口监听，请检查 CLI 日志");
+    showStartupError("启动超时：90 秒内未检测到 Web UI 就绪，请检查 CLI 日志");
   });
   await listen<number | null>("server:exited", (e) => {
     if (ready) {
