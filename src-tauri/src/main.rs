@@ -1096,6 +1096,19 @@ struct DshTheme {
     avoid: Option<DshAvoidRect>,
 }
 
+/// Header export capsule labels. Harness zh is `Session 日志`, not `Session log`.
+/// Kept next to `READ_DSH_THEME_JS` so the probe and tests share one list.
+#[cfg(test)]
+const SESSION_EXPORT_LABELS: &[&str] = &["Session log", "Session 日志"];
+
+#[cfg(test)]
+fn session_export_anchor_matches(text: &str) -> bool {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    SESSION_EXPORT_LABELS
+        .iter()
+        .any(|label| normalized == *label || normalized.starts_with(label))
+}
+
 const READ_DSH_THEME_JS: &str = r#"
 (() => {
   try {
@@ -1113,9 +1126,11 @@ const READ_DSH_THEME_JS: &str = r#"
       || "transparent";
     const dark = body.hasAttribute("data-ds-dark-theme")
       || document.documentElement.style.colorScheme === "dark";
-    const sessionLog = Array.from(document.querySelectorAll("button")).find((b) =>
-      (b.textContent || "").includes("Session log")
-    );
+    const labels = ["Session log", "Session 日志"];
+    const norm = (el) => (el.textContent || "").replace(/\s+/g, " ").trim();
+    const match = (el) => labels.some((l) => { const t = norm(el); return t === l || t.startsWith(l); });
+    const sessionLog = Array.from(document.querySelectorAll("header button")).find(match)
+      || Array.from(document.querySelectorAll("button")).find(match);
     let avoid = null;
     if (sessionLog) {
       const r = sessionLog.getBoundingClientRect();
@@ -1920,6 +1935,21 @@ mod tests {
             DSH_WEB_ARGS.contains(&"--no-open"),
             "dsh web --no-open is the public switch that skips the default browser"
         );
+    }
+
+    #[test]
+    fn session_export_anchor_matches_localized_header_labels() {
+        assert!(session_export_anchor_matches("Session log"));
+        assert!(session_export_anchor_matches("Session 日志"));
+        assert!(session_export_anchor_matches("\n  Session 日志\n"));
+        assert!(!session_export_anchor_matches("Session"));
+        assert!(!session_export_anchor_matches("导出 Session"));
+        for label in SESSION_EXPORT_LABELS {
+            assert!(
+                READ_DSH_THEME_JS.contains(label),
+                "theme probe must keep {label} in sync with session_export_anchor_matches"
+            );
+        }
     }
 
     #[test]

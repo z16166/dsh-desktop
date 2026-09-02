@@ -4,6 +4,13 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import {
+  chromeBtnReadyToShow,
+  collapseChromeBeforeOverlay,
+  sameBox,
+  syncGeometryOnFocus,
+  type Box,
+} from "./overlay-layout";
 
 const PORT = 3080;
 const DEFAULT_APP_URL = "http://127.0.0.1:" + PORT;
@@ -41,6 +48,7 @@ const CHROME_BTN_LABEL = "chrome-btn";
 const CHROME_BTN_SIZE = 36;
 const CHROME_BTN_MARGIN = 12;
 const CHROME_BTN_GAP = 8;
+const CHROME_BTN_FALLBACK_MS = 2500;
 const loading = q<HTMLDivElement>("#loading");
 const log = q<HTMLPreElement>("#log");
 const dot = q<HTMLSpanElement>("#status-dot");
@@ -73,6 +81,11 @@ let lastDshTheme: DshTheme | null = null;
 let themeTimer: number | undefined;
 let dshFocusBound = false;
 let withdrawn = false;
+let chromeBtnUp = false;
+let overlaysReadyAt = 0;
+let lastDshBox: Box | null = null;
+let lastChromeBox: Box | null = null;
+let chromeBtnFallbackTimer: number | undefined;
 
 async function mainAllowsOverlays(): Promise<boolean> {
   if (withdrawn) return false;
@@ -90,13 +103,6 @@ function startThemeSync(): void {
   const tick = () => {
     void invoke("sync_dsh_theme");
     void invoke("inject_dsh_desktop_css");
-    void (async () => {
-      if (!(await mainAllowsOverlays())) return;
-      if (!cliMode && !chromeOpen()) {
-        void invoke("raise_overlay", { label: CHROME_BTN_LABEL });
-        void syncChromeBtnBounds();
-      }
-    })();
   };
   tick();
   if (themeTimer === undefined) {
@@ -166,11 +172,15 @@ function showChrome(): void {
   })();
 }
 
-function hideChrome(): void {
-  if (cliMode) return;
-  if (chromeOpen()) {
+function collapseChromeBar(): void {
+  if (collapseChromeBeforeOverlay(cliMode) && chromeOpen()) {
     topbar.classList.remove("open");
   }
+}
+
+function hideChrome(): void {
+  if (cliMode) return;
+  collapseChromeBar();
   void (async () => {
     await syncDshBounds();
     await raiseChromeBtn();
@@ -187,21 +197,34 @@ async function dshWindow(): Promise<WebviewWindow | null> {
   return WebviewWindow.getByLabel(DSH_LABEL);
 }
 
+async function frameOverlayBox(): Promise<Box | null> {
+  try {
+    const main = getCurrentWindow();
+    const scale = await main.scaleFactor();
+    const origin = await main.innerPosition();
+    const frame = q<HTMLDivElement>("#app-frame");
+    const rect = frame.getBoundingClientRect();
+    return {
+      x: origin.x / scale + rect.left,
+      y: origin.y / scale + rect.top,
+      w: Math.max(80, rect.width),
+      h: Math.max(80, rect.height),
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function syncDshBounds(): Promise<void> {
   const wdw = await dshWindow();
   if (!wdw || cliMode || !ready) return;
   if (!(await mainAllowsOverlays())) return;
-  const main = getCurrentWindow();
-  const scale = await main.scaleFactor();
-  const origin = await main.innerPosition();
-  const frame = q<HTMLDivElement>("#app-frame");
-  const rect = frame.getBoundingClientRect();
-  const x = origin.x / scale + rect.left;
-  const y = origin.y / scale + rect.top;
-  const width = Math.max(80, rect.width);
-  const height = Math.max(80, rect.height);
-  await wdw.setPosition(new LogicalPosition(x, y));
-  await wdw.setSize(new LogicalSize(width, height));
+  const box = await frameOverlayBox();
+  if (!box) return;
+  if (lastDshBox && sameBox(lastDshBox, box)) return;
+  lastDshBox = box;
+  await wdw.setPosition(new LogicalPosition(box.x, box.y));
+  await wdw.setSize(new LogicalSize(box.w, box.h));
 }
 
 async function onMainGeometryChanged(): Promise<void> {
@@ -212,9 +235,25 @@ async function onMainGeometryChanged(): Promise<void> {
   }
   if (ready && !cliMode) {
     const wdw = await dshWindow();
-    if (wdw) await wdw.show();
+    if (wdw && !(await wdw.isVisible())) await wdw.show();
   }
   await syncOverlayBounds();
+}
+
+async function onMainFocusChanged(): Promise<void> {
+  if (syncGeometryOnFocus()) {
+    await onMainGeometryChanged();
+    return;
+  }
+  if (!(await mainAllowsOverlays())) {
+    await hideDshWindow();
+    await hideChromeBtn();
+    return;
+  }
+  if (ready && !cliMode) {
+    const wdw = await dshWindow();
+    if (wdw && !(await wdw.isVisible())) await wdw.show();
+  }
 }
 
 async function syncOverlayBounds(): Promise<void> {
@@ -260,36 +299,57 @@ async function syncChromeBtnBounds(): Promise<void> {
   const wdw = await chromeBtnWindow();
   if (!wdw) return;
   if (!(await mainAllowsOverlays())) return;
-  const main = getCurrentWindow();
-  const scale = await main.scaleFactor();
-  const origin = await main.innerPosition();
-  const frame = q<HTMLDivElement>("#app-frame");
-  const rect = frame.getBoundingClientRect();
-  const baseX = origin.x / scale + rect.left;
-  const baseY = origin.y / scale + rect.top;
-  let x = baseX + rect.width - CHROME_BTN_SIZE - CHROME_BTN_MARGIN;
-  let y = baseY + CHROME_BTN_MARGIN;
+  const frame = await frameOverlayBox();
+  if (!frame) return;
+  let x = frame.x + frame.w - CHROME_BTN_SIZE - CHROME_BTN_MARGIN;
+  let y = frame.y + CHROME_BTN_MARGIN;
   const avoid = lastDshTheme?.avoid;
   if (avoid && avoid.w > 0 && avoid.h > 0) {
-    x = baseX + avoid.x - CHROME_BTN_GAP - CHROME_BTN_SIZE;
-    y = baseY + avoid.y + (avoid.h - CHROME_BTN_SIZE) / 2;
+    x = frame.x + avoid.x - CHROME_BTN_GAP - CHROME_BTN_SIZE;
+    y = frame.y + avoid.y + (avoid.h - CHROME_BTN_SIZE) / 2;
   }
-  const minX = baseX + 4;
-  const maxX = baseX + rect.width - CHROME_BTN_SIZE - 4;
-  const minY = baseY + 4;
-  const maxY = baseY + rect.height - CHROME_BTN_SIZE - 4;
+  const minX = frame.x + 4;
+  const maxX = frame.x + frame.w - CHROME_BTN_SIZE - 4;
+  const minY = frame.y + 4;
+  const maxY = frame.y + frame.h - CHROME_BTN_SIZE - 4;
   x = Math.min(maxX, Math.max(minX, x));
   y = Math.min(maxY, Math.max(minY, y));
+  const box: Box = { x, y, w: CHROME_BTN_SIZE, h: CHROME_BTN_SIZE };
+  if (lastChromeBox && sameBox(lastChromeBox, box)) return;
+  lastChromeBox = box;
   await wdw.setPosition(new LogicalPosition(x, y));
   await wdw.setSize(new LogicalSize(CHROME_BTN_SIZE, CHROME_BTN_SIZE));
 }
 
 async function hideChromeBtn(): Promise<void> {
+  chromeBtnUp = false;
+  lastChromeBox = null;
   const wdw = await chromeBtnWindow();
   if (wdw) await wdw.hide();
 }
 
-async function raiseChromeBtn(): Promise<void> {
+function chromeWaitedMs(): number {
+  return overlaysReadyAt === 0 ? 0 : Date.now() - overlaysReadyAt;
+}
+
+function tryShowChromeBtn(): void {
+  if (cliMode || chromeOpen() || !ready) return;
+  if (!chromeBtnReadyToShow(lastDshTheme?.avoid, chromeWaitedMs(), CHROME_BTN_FALLBACK_MS)) {
+    return;
+  }
+  void runOverlayOp(() => raiseChromeBtn());
+}
+
+function scheduleChromeBtn(): void {
+  tryShowChromeBtn();
+  if (chromeBtnFallbackTimer !== undefined) return;
+  chromeBtnFallbackTimer = window.setTimeout(() => {
+    chromeBtnFallbackTimer = undefined;
+    tryShowChromeBtn();
+  }, CHROME_BTN_FALLBACK_MS);
+}
+
+async function raiseChromeBtn(forceRaise = false): Promise<void> {
   if (cliMode || chromeOpen() || !(await mainAllowsOverlays())) {
     await hideChromeBtn();
     return;
@@ -297,8 +357,12 @@ async function raiseChromeBtn(): Promise<void> {
   try {
     const wdw = await ensureChromeBtn();
     await syncChromeBtnBounds();
-    await wdw.show();
-    await invoke("raise_overlay", { label: CHROME_BTN_LABEL });
+    const alreadyUp = chromeBtnUp;
+    if (!alreadyUp) await wdw.show();
+    chromeBtnUp = true;
+    if (!alreadyUp || forceRaise) {
+      await invoke("raise_overlay", { label: CHROME_BTN_LABEL });
+    }
     startThemeSync();
     if (lastDshTheme) void emit("dsh:theme", lastDshTheme);
   } catch (e) {
@@ -313,6 +377,13 @@ async function hideDshWindow(): Promise<void> {
 
 async function closeDshWindow(): Promise<void> {
   dshFocusBound = false;
+  lastDshBox = null;
+  lastDshTheme = null;
+  overlaysReadyAt = 0;
+  if (chromeBtnFallbackTimer !== undefined) {
+    window.clearTimeout(chromeBtnFallbackTimer);
+    chromeBtnFallbackTimer = undefined;
+  }
   const wdw = await dshWindow();
   if (wdw) await wdw.close();
 }
@@ -327,6 +398,7 @@ async function showApp(): Promise<void> {
   let wdw = await dshWindow();
   if (!wdw) {
     const main = getCurrentWindow();
+    const box = (await frameOverlayBox()) ?? { x: 0, y: 0, w: 800, h: 600 };
     wdw = new WebviewWindow(DSH_LABEL, {
       url: appUrl,
       parent: main,
@@ -334,7 +406,12 @@ async function showApp(): Promise<void> {
       skipTaskbar: true,
       resizable: false,
       shadow: false,
-      focus: true,
+      focus: false,
+      visible: false,
+      x: Math.round(box.x),
+      y: Math.round(box.y),
+      width: Math.round(box.w),
+      height: Math.round(box.h),
       zoomHotkeysEnabled: true,
     });
     await new Promise<void>((resolve, reject) => {
@@ -349,18 +426,20 @@ async function showApp(): Promise<void> {
       });
     });
     appendLog("> 已用独立窗口加载 Web UI（避免 iframe 跨站拦截插件）", "sys");
-  } else {
-    await wdw.show();
   }
   if (!dshFocusBound) {
     dshFocusBound = true;
     await wdw.onFocusChanged(({ payload: focused }) => {
-      if (focused && !cliMode && !chromeOpen()) void raiseChromeBtn();
+      if (focused && !cliMode && !chromeOpen() && chromeBtnUp) {
+        void raiseChromeBtn(true);
+      }
     });
   }
   await syncDshBounds();
+  if (!(await wdw.isVisible())) await wdw.show();
+  overlaysReadyAt = Date.now();
   startThemeSync();
-  await runOverlayOp(() => raiseChromeBtn());
+  scheduleChromeBtn();
 }
 
 function launchCommandLabel(): string {
@@ -491,8 +570,8 @@ async function setupEvents(): Promise<void> {
     setStatus("running", "运行中 · " + publicAppUrl(appUrl));
     void (async () => {
       if (urlChanged) await closeDshWindow();
+      if (collapseChromeBeforeOverlay(cliMode)) collapseChromeBar();
       await showApp();
-      if (!cliMode) hideChrome();
     })();
     appendLog("> 就绪：" + publicAppUrl(appUrl), "sys");
     refreshDshVersion();
@@ -529,7 +608,9 @@ async function setupEvents(): Promise<void> {
   });
   await listen<DshTheme>("dsh:theme", (e) => {
     lastDshTheme = e.payload;
-    if (!cliMode && !chromeOpen()) void syncChromeBtnBounds();
+    if (cliMode || chromeOpen()) return;
+    if (!chromeBtnUp) tryShowChromeBtn();
+    else void syncChromeBtnBounds();
   });
   await listen("dsh:theme-request", () => {
     if (lastDshTheme) void emit("dsh:theme", lastDshTheme);
@@ -625,7 +706,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     void onMainGeometryChanged();
   });
   await main.onFocusChanged(() => {
-    void onMainGeometryChanged();
+    void onMainFocusChanged();
   });
   await setupEvents();
   try {
