@@ -100,14 +100,20 @@ async function mainAllowsOverlays(): Promise<boolean> {
 }
 
 function startThemeSync(): void {
+  if (themeTimer !== undefined) return;
   const tick = () => {
     void invoke("sync_dsh_theme");
-    void invoke("inject_dsh_desktop_css");
   };
   tick();
-  if (themeTimer === undefined) {
-    themeTimer = window.setInterval(tick, 1500);
-  }
+  themeTimer = window.setInterval(tick, 1500);
+}
+
+/** Nothing consumes a theme or an anchor rect while the overlay is off screen,
+ * so every path that hides it stops the poll instead of leaving it running. */
+function stopThemeSync(): void {
+  if (themeTimer === undefined) return;
+  window.clearInterval(themeTimer);
+  themeTimer = undefined;
 }
 
 function setStatus(state: State, text: string): void {
@@ -235,7 +241,7 @@ async function onMainGeometryChanged(): Promise<void> {
   }
   if (ready && !cliMode) {
     const wdw = await dshWindow();
-    if (wdw && !(await wdw.isVisible())) await wdw.show();
+    if (wdw) await showDshWindow(wdw);
   }
   await syncOverlayBounds();
 }
@@ -252,7 +258,7 @@ async function onMainFocusChanged(): Promise<void> {
   }
   if (ready && !cliMode) {
     const wdw = await dshWindow();
-    if (wdw && !(await wdw.isVisible())) await wdw.show();
+    if (wdw) await showDshWindow(wdw);
   }
 }
 
@@ -370,12 +376,21 @@ async function raiseChromeBtn(forceRaise = false): Promise<void> {
   }
 }
 
+/** Putting the overlay back on screen has to restart the poll that hiding it
+ * stopped, so the two always travel together. */
+async function showDshWindow(wdw: WebviewWindow): Promise<void> {
+  if (!(await wdw.isVisible())) await wdw.show();
+  startThemeSync();
+}
+
 async function hideDshWindow(): Promise<void> {
+  stopThemeSync();
   const wdw = await dshWindow();
   if (wdw) await wdw.hide();
 }
 
 async function closeDshWindow(): Promise<void> {
+  stopThemeSync();
   dshFocusBound = false;
   lastDshBox = null;
   lastDshTheme = null;
@@ -440,9 +455,8 @@ async function showApp(): Promise<void> {
     });
   }
   await syncDshBounds();
-  if (!(await wdw.isVisible())) await wdw.show();
+  await showDshWindow(wdw);
   overlaysReadyAt = Date.now();
-  startThemeSync();
   scheduleChromeBtn();
 }
 

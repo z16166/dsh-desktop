@@ -60,6 +60,9 @@ fn allow_overlay_z_raise(picker_showing: bool, foreground_is_ours: bool) -> bool
     !picker_showing && foreground_is_ours
 }
 
+/// The class every `IFileOpenDialog` carries.
+const DIALOG_CLASS: &str = "#32770";
+
 /// Only ever a native dialog, never just "a window the harness owns".
 ///
 /// `#32770` is the class every `IFileOpenDialog` carries — but plenty of
@@ -77,7 +80,7 @@ fn should_lift_foreign_window(
     foreground_is_ours: bool,
     is_visible_toplevel: bool,
 ) -> bool {
-    if !is_visible_toplevel || window_pid == our_pid || class != "#32770" {
+    if !is_visible_toplevel || window_pid == our_pid || class != DIALOG_CLASS {
         return false;
     }
     in_dsh_tree || foreground_is_ours
@@ -1236,6 +1239,10 @@ struct DshTheme {
     /// to recover the zoom factor, so it is not passed on to the frontend.
     #[serde(default, skip_serializing)]
     dpr: Option<f64>,
+    /// Whether our own CSS is still on the page. False on the first poll and
+    /// after a reload, which is the only time it is worth injecting again.
+    #[serde(default, skip_serializing)]
+    styled: bool,
 }
 
 /// Header export capsule labels. Harness zh is `Session 日志`, not `Session log`.
@@ -1271,8 +1278,15 @@ const READ_DSH_THEME_JS: &str = r#"
     const labels = ["Session log", "Session 日志"];
     const norm = (el) => (el.textContent || "").replace(/\s+/g, " ").trim();
     const match = (el) => labels.some((l) => { const t = norm(el); return t === l || t.startsWith(l); });
-    const sessionLog = Array.from(document.querySelectorAll("header button")).find(match)
-      || Array.from(document.querySelectorAll("button")).find(match);
+    // Cached across polls: scanning every button in a long conversation is by
+    // far the costliest thing here, and the capsule outlives the scan.
+    let sessionLog = window.__dshDesktopAnchor;
+    if (!sessionLog || !sessionLog.isConnected || !match(sessionLog)) {
+      sessionLog = Array.from(document.querySelectorAll("header button")).find(match)
+        || Array.from(document.querySelectorAll("button")).find(match)
+        || null;
+      window.__dshDesktopAnchor = sessionLog;
+    }
     let avoid = null;
     if (sessionLog) {
       const r = sessionLog.getBoundingClientRect();
@@ -1280,7 +1294,8 @@ const READ_DSH_THEME_JS: &str = r#"
         avoid = { x: r.left, y: r.top, w: r.width, h: r.height };
       }
     }
-    return { dark, bg, fg, border, avoid, dpr: window.devicePixelRatio };
+    const styled = document.documentElement.classList.contains("dsh-desktop-wide-chat");
+    return { dark, bg, fg, border, avoid, dpr: window.devicePixelRatio, styled };
   } catch (e) {
     return null;
   }
@@ -1307,6 +1322,11 @@ fn sync_dsh_theme(app: AppHandle) {
         };
         if theme.bg.is_empty() {
             return;
+        }
+        if !theme.styled {
+            if let Some(wdw) = app.get_webview_window("dsh") {
+                inject_dsh_desktop_css(&wdw);
+            }
         }
         let zoom = observed_zoom(theme.dpr, scale_factor);
         if let Some(dpr) = theme.dpr.filter(|d| d.is_finite() && *d > 0.0) {
@@ -1380,14 +1400,14 @@ const INJECT_WIDE_CHAT_JS: &str = r#"
 
 /// Widen the Conversation tab past Harness's 748px content cap.
 ///
+/// Driven by the theme poll's `styled` flag rather than run on every tick: the
+/// script is idempotent, but its font probe measures text on a canvas, and on
+/// a machine without the font installed that measuring would never stop.
+///
 /// Ctrl +/-/0 zoom is deliberately not bound here: `zoomHotkeysEnabled` leaves
 /// WebView2's `IsZoomControlEnabled` and browser accelerator keys on, so the
 /// runtime already handles those keys whenever this webview holds focus.
-#[tauri::command]
-fn inject_dsh_desktop_css(app: AppHandle) {
-    let Some(wdw) = app.get_webview_window("dsh") else {
-        return;
-    };
+fn inject_dsh_desktop_css(wdw: &tauri::WebviewWindow) {
     let _ = wdw.eval(INJECT_WIDE_CHAT_JS);
 }
 
@@ -1631,9 +1651,22 @@ fn lift_foreign_dialog(hwnd: isize) {
 }
 
 /// Called only for windows the WinEvent hook has just seen appear.
+///
+/// The hook is desktop-wide, so this runs for every window every process
+/// shows. `should_lift_foreign_window` owns the decision; the ordering here is
+/// about its cost. `parent_pid` snapshots the whole process table once per
+/// ancestor, so that walk sits behind the class check, which every window but
+/// an actual dialog fails.
 #[cfg(windows)]
 fn consider_lift(hwnd: isize) {
-    if hwnd == 0 || !is_visible_toplevel(hwnd) {
+    if hwnd == 0 {
+        return;
+    }
+    let class = window_class(hwnd);
+    if class != DIALOG_CLASS {
+        return;
+    }
+    if !is_visible_toplevel(hwnd) {
         return;
     }
     let wpid = window_pid(hwnd);
@@ -1641,7 +1674,6 @@ fn consider_lift(hwnd: isize) {
     if wpid == ours {
         return;
     }
-    let class = window_class(hwnd);
     let in_tree = {
         let root = DSH_ROOT_PID.load(Ordering::SeqCst);
         root != 0 && pid_is_under_root_with(wpid, root, parent_pid)
@@ -2020,7 +2052,6 @@ fn main() {
             upgrade_dsh,
             dsh_version,
             sync_dsh_theme,
-            inject_dsh_desktop_css,
             restore_dsh_zoom,
             raise_overlay
         ])
