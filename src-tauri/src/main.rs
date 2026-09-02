@@ -150,16 +150,19 @@ fn persist_window_state_for(label: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayAction {
     ShowChrome,
+    PickFont,
     Quit,
     None,
 }
 
 const TRAY_SHOW_CHROME_ID: &str = "show-chrome";
+const TRAY_FONT_ID: &str = "pick-font";
 const TRAY_QUIT_ID: &str = "quit";
 
 fn tray_menu_action(id: &str) -> TrayAction {
     match id {
         TRAY_SHOW_CHROME_ID => TrayAction::ShowChrome,
+        TRAY_FONT_ID => TrayAction::PickFont,
         TRAY_QUIT_ID => TrayAction::Quit,
         _ => TrayAction::None,
     }
@@ -198,6 +201,10 @@ struct AppSettings {
     local_path: String,
     #[serde(default = "default_zoom")]
     zoom: f64,
+    /// Family name to force on the Harness page. Empty means the built-in
+    /// LXGW WenKai probe, which on a machine without it leaves the page alone.
+    #[serde(default)]
+    font: String,
 }
 
 impl Default for AppSettings {
@@ -206,6 +213,7 @@ impl Default for AppSettings {
             source: LaunchSource::Local,
             local_path: default_local_path(),
             zoom: default_zoom(),
+            font: String::new(),
         }
     }
 }
@@ -363,6 +371,47 @@ fn record_dpr(current: f64) -> bool {
         bits => Some(f64::from_bits(bits)),
     };
     dpr_moved(previous, current)
+}
+
+/// The font the page should be using, cached so the 1.5s poll can check it
+/// without reading the settings file every tick.
+static WANTED_FONT: Mutex<Option<String>> = Mutex::new(None);
+
+fn wanted_font(app: &AppHandle) -> String {
+    let mut guard = WANTED_FONT.lock().unwrap();
+    guard.get_or_insert_with(|| load_settings(app).font).clone()
+}
+
+fn remember_wanted_font(font: &str) {
+    *WANTED_FONT.lock().unwrap() = Some(font.to_string());
+}
+
+/// Whether the page is missing the font it should have.
+///
+/// An empty `applied` means nothing has been injected yet. Once the script has
+/// run it always leaves a marker behind — the family it settled on, or `-` when
+/// the probe found nothing — so an empty `wanted` is satisfied by any marker
+/// and the probe never runs twice.
+fn font_needs_injection(applied: &str, wanted: &str) -> bool {
+    if applied.is_empty() {
+        return true;
+    }
+    if wanted.is_empty() {
+        return false;
+    }
+    applied != wanted
+}
+
+/// Family names GDI reports that are worth offering: no blanks, and none of
+/// the `@`-prefixed vertical-writing variants, which are the same faces rotated.
+fn usable_font_families(raw: Vec<String>) -> Vec<String> {
+    let mut names: Vec<String> = raw
+        .into_iter()
+        .filter(|name| !name.is_empty() && !name.starts_with('@'))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn remember_dsh_zoom(app: &AppHandle, zoom: f64) {
@@ -1040,11 +1089,40 @@ fn set_settings(app: AppHandle, mut settings: AppSettings) -> Result<AppSettings
     if settings.source == LaunchSource::Local {
         validate_local_repo(&settings.local_path)?;
     }
-    // The zoom is observed from the page rather than edited in the settings UI,
-    // whose payload carries no zoom and would reset it to the serde default.
-    settings.zoom = load_settings(&app).zoom;
+    // Zoom and font are set from the page and the tray, not from the settings
+    // UI, whose payload carries neither and would reset both to their defaults.
+    let stored = load_settings(&app);
+    settings.zoom = stored.zoom;
+    settings.font = stored.font;
     save_settings(&app, &settings)?;
     Ok(settings)
+}
+
+/// Family names installed on this machine, for the picker window.
+///
+/// `async` so the enumeration lands on Tauri's thread pool: it walks the
+/// registry-backed font tables, which on a cold cache or a machine with a large
+/// font library is slow enough to stall the event loop noticeably.
+#[tauri::command(async)]
+fn list_system_fonts() -> Vec<String> {
+    usable_font_families(enumerate_font_families())
+}
+
+#[tauri::command]
+fn set_dsh_font(app: AppHandle, name: String) -> Result<(), String> {
+    let mut settings = load_settings(&app);
+    settings.font = name;
+    save_settings(&app, &settings)?;
+    remember_wanted_font(&settings.font);
+    if let Some(wdw) = app.get_webview_window("dsh") {
+        inject_dsh_desktop_css(&wdw, &settings.font);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_dsh_font(app: AppHandle) -> String {
+    wanted_font(&app)
 }
 
 #[tauri::command]
@@ -1243,6 +1321,10 @@ struct DshTheme {
     /// after a reload, which is the only time it is worth injecting again.
     #[serde(default, skip_serializing)]
     styled: bool,
+    /// The family the page is currently forced to, `-` when the probe found
+    /// nothing, empty when the script has never run. Host-side only.
+    #[serde(default, skip_serializing)]
+    font: String,
 }
 
 /// Header export capsule labels. Harness zh is `Session 日志`, not `Session log`.
@@ -1295,7 +1377,8 @@ const READ_DSH_THEME_JS: &str = r#"
       }
     }
     const styled = document.documentElement.classList.contains("dsh-desktop-wide-chat");
-    return { dark, bg, fg, border, avoid, dpr: window.devicePixelRatio, styled };
+    const font = document.documentElement.dataset.dshDesktopFont || "";
+    return { dark, bg, fg, border, avoid, dpr: window.devicePixelRatio, styled, font };
   } catch (e) {
     return null;
   }
@@ -1323,9 +1406,10 @@ fn sync_dsh_theme(app: AppHandle) {
         if theme.bg.is_empty() {
             return;
         }
-        if !theme.styled {
+        let wanted = wanted_font(&app);
+        if !theme.styled || font_needs_injection(&theme.font, &wanted) {
             if let Some(wdw) = app.get_webview_window("dsh") {
-                inject_dsh_desktop_css(&wdw);
+                inject_dsh_desktop_css(&wdw, &wanted);
             }
         }
         let zoom = observed_zoom(theme.dpr, scale_factor);
@@ -1351,7 +1435,10 @@ fn sync_dsh_theme(app: AppHandle) {
     });
 }
 
-const INJECT_WIDE_CHAT_JS: &str = r#"
+/// Placeholder for the family name the user picked, filled in per injection.
+const WANTED_FONT_SLOT: &str = "__DSH_WANTED_FONT__";
+
+const INJECT_DSH_DESKTOP_JS: &str = r#"
 (() => {
   const head = document.head || document.documentElement;
   const wideId = "dsh-desktop-wide-chat";
@@ -1363,57 +1450,71 @@ const INJECT_WIDE_CHAT_JS: &str = r#"
     head.appendChild(style);
   }
 
-  const fontId = "dsh-desktop-lxgw-font";
-  if (!document.getElementById(fontId)) {
-    const names = [
-      "霞鹜文楷等宽 GB 屏幕阅读版",
-      "LXGW WenKai Mono GB Screen",
-    ];
-    const pick = (candidates) => {
-      const ctx = document.createElement("canvas").getContext("2d");
-      if (!ctx) return null;
-      const sample = "mmmmmmmmlli汉字國國";
-      for (const name of candidates) {
-        for (const base of ["monospace", "serif", "sans-serif"]) {
-          ctx.font = "72px " + base;
-          const fallback = ctx.measureText(sample).width;
-          ctx.font = '72px "' + name + '", ' + base;
-          if (ctx.measureText(sample).width !== fallback) return name;
-        }
+  const wanted = __DSH_WANTED_FONT__;
+  // Only reached when no font was chosen: measure whether the bundled default
+  // is installed, since naming a missing family would silently do nothing.
+  const probe = () => {
+    const ctx = document.createElement("canvas").getContext("2d");
+    if (!ctx) return null;
+    const sample = "mmmmmmmmlli汉字國國";
+    for (const name of ["霞鹜文楷等宽 GB 屏幕阅读版", "LXGW WenKai Mono GB Screen"]) {
+      for (const base of ["monospace", "serif", "sans-serif"]) {
+        ctx.font = "72px " + base;
+        const fallback = ctx.measureText(sample).width;
+        ctx.font = '72px ' + JSON.stringify(name) + ', ' + base;
+        if (ctx.measureText(sample).width !== fallback) return name;
       }
-      return null;
-    };
-    const name = pick(names);
-    if (name) {
-      const style = document.createElement("style");
-      style.id = fontId;
-      const quoted = '"' + name + '"';
-      style.textContent =
-        "html.dsh-desktop-lxgw,html.dsh-desktop-lxgw body,html.dsh-desktop-lxgw *:not(svg):not(path){font-family:" +
-        quoted +
-        ",monospace!important;}" +
-        "html.dsh-desktop-lxgw{--dsw-font-family:" +
-        quoted +
-        ",monospace!important;}";
-      document.documentElement.classList.add("dsh-desktop-lxgw");
-      head.appendChild(style);
     }
+    return null;
+  };
+  const name = wanted || probe();
+
+  const fontId = "dsh-desktop-font";
+  let style = document.getElementById(fontId);
+  if (!style) {
+    style = document.createElement("style");
+    style.id = fontId;
+    head.appendChild(style);
   }
+  if (name) {
+    const quoted = JSON.stringify(name);
+    style.textContent =
+      "html.dsh-desktop-font,html.dsh-desktop-font body,html.dsh-desktop-font *:not(svg):not(path){font-family:" +
+      quoted +
+      ",monospace!important;}" +
+      "html.dsh-desktop-font{--dsw-font-family:" +
+      quoted +
+      ",monospace!important;}";
+    document.documentElement.classList.add("dsh-desktop-font");
+  } else {
+    style.textContent = "";
+    document.documentElement.classList.remove("dsh-desktop-font");
+  }
+  // What the host compares against the setting to decide on a re-injection.
+  // "-" records that the probe ran and came up empty, so it runs only once.
+  document.documentElement.dataset.dshDesktopFont = name || "-";
   return true;
 })()
 "#;
 
-/// Widen the Conversation tab past Harness's 748px content cap.
+fn inject_dsh_desktop_js(wanted: &str) -> String {
+    let literal = serde_json::to_string(wanted).unwrap_or_else(|_| "\"\"".to_string());
+    INJECT_DSH_DESKTOP_JS.replace(WANTED_FONT_SLOT, &literal)
+}
+
+/// Widen the Conversation tab past Harness's 748px content cap and put the
+/// chosen font on the page.
 ///
-/// Driven by the theme poll's `styled` flag rather than run on every tick: the
-/// script is idempotent, but its font probe measures text on a canvas, and on
-/// a machine without the font installed that measuring would never stop.
+/// Driven by the theme poll's markers rather than run on every tick: the script
+/// is idempotent, but its font probe measures text on a canvas, and on a
+/// machine without the bundled font that measuring would never stop.
 ///
 /// Ctrl +/-/0 zoom is deliberately not bound here: `zoomHotkeysEnabled` leaves
 /// WebView2's `IsZoomControlEnabled` and browser accelerator keys on, so the
 /// runtime already handles those keys whenever this webview holds focus.
-fn inject_dsh_desktop_css(wdw: &tauri::WebviewWindow) {
-    let _ = wdw.eval(INJECT_WIDE_CHAT_JS);
+fn inject_dsh_desktop_css(wdw: &tauri::WebviewWindow, wanted: &str) {
+    let script = inject_dsh_desktop_js(wanted);
+    let _ = wdw.eval(&script);
 }
 
 /// Ask for the saved zoom to be put back on a webview that was just created,
@@ -1462,8 +1563,37 @@ mod win32 {
         pub sz_exe_file: [u16; 260],
     }
 
+    /// `LOGFONTW`. Also the first member of the `ENUMLOGFONTEXW` the font
+    /// enumerator hands back, which is why the callback can read one of these.
+    #[repr(C)]
+    pub struct LogFontW {
+        pub lf_height: i32,
+        pub lf_width: i32,
+        pub lf_escapement: i32,
+        pub lf_orientation: i32,
+        pub lf_weight: i32,
+        pub lf_italic: u8,
+        pub lf_underline: u8,
+        pub lf_strike_out: u8,
+        pub lf_char_set: u8,
+        pub lf_out_precision: u8,
+        pub lf_clip_precision: u8,
+        pub lf_quality: u8,
+        pub lf_pitch_and_family: u8,
+        pub lf_face_name: [u16; 32],
+    }
+
+    pub type FontEnumProcW = unsafe extern "system" fn(
+        *const LogFontW,
+        *const std::ffi::c_void,
+        u32,
+        isize,
+    ) -> i32;
+
     #[link(name = "user32")]
     extern "system" {
+        pub fn GetDC(hwnd: isize) -> isize;
+        pub fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
         pub fn SetWindowPos(
             hwnd: isize,
             insert_after: isize,
@@ -1520,6 +1650,66 @@ mod win32 {
         ) -> i32;
         pub fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_group_id: u32) -> i32;
     }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        pub fn EnumFontFamiliesExW(
+            hdc: isize,
+            lp_logfont: *mut LogFontW,
+            lp_proc: FontEnumProcW,
+            l_param: isize,
+            dw_flags: u32,
+        ) -> i32;
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn collect_font_family(
+    logfont: *const win32::LogFontW,
+    _metrics: *const std::ffi::c_void,
+    _font_type: u32,
+    l_param: isize,
+) -> i32 {
+    if logfont.is_null() || l_param == 0 {
+        return 0;
+    }
+    let names = &mut *(l_param as *mut Vec<String>);
+    let face = &(*logfont).lf_face_name;
+    let len = face.iter().position(|&c| c == 0).unwrap_or(face.len());
+    names.push(String::from_utf16_lossy(&face[..len]));
+    1
+}
+
+/// Every installed family, straight from GDI, duplicates and all.
+///
+/// `DEFAULT_CHARSET` reports a family once per charset it covers, so the
+/// caller's dedupe is what turns this into a list.
+#[cfg(windows)]
+fn enumerate_font_families() -> Vec<String> {
+    const DEFAULT_CHARSET: u8 = 1;
+    let mut names: Vec<String> = Vec::new();
+    unsafe {
+        let hdc = win32::GetDC(0);
+        if hdc == 0 {
+            return names;
+        }
+        let mut request: win32::LogFontW = std::mem::zeroed();
+        request.lf_char_set = DEFAULT_CHARSET;
+        win32::EnumFontFamiliesExW(
+            hdc,
+            &mut request,
+            collect_font_family,
+            &mut names as *mut Vec<String> as isize,
+            0,
+        );
+        win32::ReleaseDC(0, hdc);
+    }
+    names
+}
+
+#[cfg(not(windows))]
+fn enumerate_font_families() -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(windows)]
@@ -1904,6 +2094,7 @@ fn hide_to_tray(app: &AppHandle) {
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
 const QUIT_WINDOW_LABEL: &str = "quitting";
+const FONT_WINDOW_LABEL: &str = "font-picker";
 
 /// True only for the click that owns the shutdown; later ones lose the race.
 fn claim_quit(flag: &AtomicBool) -> bool {
@@ -1991,6 +2182,39 @@ fn show_chrome_from_tray(app: &AppHandle) {
     let _ = app.emit("chrome:show", ());
 }
 
+/// A real window rather than an in-page panel: the picker previews families by
+/// rendering in them, and the Harness page is not ours to draw a list into.
+fn show_font_picker(app: &AppHandle) {
+    if quitting() {
+        return;
+    }
+    if let Some(wdw) = app.get_webview_window(FONT_WINDOW_LABEL) {
+        let _ = wdw.unminimize();
+        let _ = wdw.show();
+        let _ = wdw.set_focus();
+        return;
+    }
+    let built = tauri::WebviewWindowBuilder::new(
+        app,
+        FONT_WINDOW_LABEL,
+        tauri::WebviewUrl::App("font.html".into()),
+    )
+    .title("选择字体")
+    .inner_size(520.0, 620.0)
+    .min_inner_size(420.0, 420.0)
+    .center()
+    .always_on_top(true)
+    .focused(true)
+    .build();
+    match built {
+        Ok(wdw) => {
+            let _ = wdw.show();
+            let _ = wdw.set_focus();
+        }
+        Err(e) => eprintln!("dsh-desktop: could not open the font picker: {e}"),
+    }
+}
+
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show_chrome = MenuItem::with_id(
         app,
@@ -1999,8 +2223,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         true,
         None::<&str>,
     )?;
+    let pick_font = MenuItem::with_id(app, TRAY_FONT_ID, "选择字体…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, TRAY_QUIT_ID, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_chrome, &quit])?;
+    let menu = Menu::with_items(app, &[&show_chrome, &pick_font, &quit])?;
     let icon = app
         .default_window_icon()
         .cloned()
@@ -2012,6 +2237,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match tray_menu_action(event.id.as_ref()) {
             TrayAction::ShowChrome => show_chrome_from_tray(app),
+            TrayAction::PickFont => show_font_picker(app),
             TrayAction::Quit => begin_quit(app),
             TrayAction::None => {}
         })
@@ -2070,6 +2296,9 @@ fn main() {
             dsh_version,
             sync_dsh_theme,
             restore_dsh_zoom,
+            list_system_fonts,
+            set_dsh_font,
+            get_dsh_font,
             raise_overlay
         ])
         .setup(|app| {
@@ -2140,14 +2369,17 @@ mod tests {
             source: LaunchSource::Local,
             local_path: r"H:\github\deepseek-harness".to_string(),
             zoom: 1.25,
+            font: "Consolas".to_string(),
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"source\":\"local\""));
         assert!(json.contains("\"localPath\""));
+        assert!(json.contains("\"font\":\"Consolas\""));
         let parsed: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.source, LaunchSource::Local);
         assert_eq!(parsed.local_path, settings.local_path);
         assert_eq!(parsed.zoom, 1.25);
+        assert_eq!(parsed.font, "Consolas");
     }
 
     #[test]
@@ -2155,6 +2387,41 @@ mod tests {
         let parsed: AppSettings =
             serde_json::from_str(r#"{"source":"npx","localPath":"H:\\repo"}"#).unwrap();
         assert_eq!(parsed.zoom, 1.0);
+        assert_eq!(parsed.font, "");
+    }
+
+    #[test]
+    fn font_needs_injection_only_when_the_page_is_missing_the_wanted_family() {
+        assert!(font_needs_injection("", ""));
+        assert!(font_needs_injection("", "Consolas"));
+        assert!(!font_needs_injection("-", ""));
+        assert!(!font_needs_injection("霞鹜文楷等宽 GB 屏幕阅读版", ""));
+        assert!(!font_needs_injection("Consolas", "Consolas"));
+        assert!(font_needs_injection("Consolas", "Sarasa Mono SC"));
+    }
+
+    #[test]
+    fn usable_font_families_drops_verticals_blanks_and_duplicates() {
+        assert_eq!(
+            usable_font_families(vec![
+                "宋体".into(),
+                "@宋体".into(),
+                "".into(),
+                "Consolas".into(),
+                "宋体".into(),
+                "Arial".into(),
+            ]),
+            vec!["Arial", "Consolas", "宋体"]
+        );
+    }
+
+    #[test]
+    fn inject_script_substitutes_the_wanted_family() {
+        let script = inject_dsh_desktop_js("Sarasa Mono SC");
+        assert!(!script.contains(WANTED_FONT_SLOT));
+        assert!(script.contains("\"Sarasa Mono SC\""));
+        let auto = inject_dsh_desktop_js("");
+        assert!(auto.contains("const wanted = \"\";") || auto.contains("const wanted = \"\""));
     }
 
     #[test]
@@ -2428,8 +2695,18 @@ mod tests {
     #[test]
     fn tray_offers_a_toolbar_escape_hatch_next_to_quit() {
         assert_eq!(tray_menu_action(TRAY_SHOW_CHROME_ID), TrayAction::ShowChrome);
+        assert_eq!(tray_menu_action(TRAY_FONT_ID), TrayAction::PickFont);
         assert_eq!(tray_menu_action(TRAY_QUIT_ID), TrayAction::Quit);
         assert_eq!(tray_menu_action("whatever"), TrayAction::None);
+    }
+
+    #[test]
+    fn font_picker_is_neither_overlay_nor_persisted() {
+        assert!(!persist_window_state_for(FONT_WINDOW_LABEL));
+        assert!(
+            !OWNED_OVERLAY_LABELS.contains(&FONT_WINDOW_LABEL),
+            "withdrawing the shell must not hide the font picker"
+        );
     }
 
     #[test]

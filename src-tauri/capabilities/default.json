@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main", "dsh", "chrome-btn"],
+  "windows": ["main", "dsh", "chrome-btn", "font-picker"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",
