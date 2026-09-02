@@ -440,8 +440,7 @@ async function showApp(): Promise<void> {
         reject(e.payload ?? e);
       });
     });
-    // Only on creation: a host-set zoom is WebView2's new default and survives
-    // navigation, and re-applying later would fight a zoom the poll that keeps
+    // Only on creation: re-arming later would fight a zoom the poll that keeps
     // the setting current has not caught up with yet.
     void invoke("restore_dsh_zoom");
     appendLog("> 已用独立窗口加载 Web UI（避免 iframe 跨站拦截插件）", "sys");

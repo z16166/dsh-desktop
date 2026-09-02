@@ -1329,10 +1329,15 @@ fn sync_dsh_theme(app: AppHandle) {
             }
         }
         let zoom = observed_zoom(theme.dpr, scale_factor);
-        if let Some(dpr) = theme.dpr.filter(|d| d.is_finite() && *d > 0.0) {
-            if record_dpr(dpr) {
-                remember_dsh_zoom(&app, zoom);
-            }
+        let moved = theme
+            .dpr
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .is_some_and(record_dpr);
+        if ZOOM_RESTORE_PENDING.swap(false, Ordering::SeqCst) {
+            // Restoring moves the ratio itself, which is not the user zooming.
+            apply_saved_zoom(&app);
+        } else if moved {
+            remember_dsh_zoom(&app, zoom);
         }
         // The probe measures in CSS pixels; overlays are placed in logical
         // pixels, and the zoom factor is the ratio between the two.
@@ -1411,17 +1416,29 @@ fn inject_dsh_desktop_css(wdw: &tauri::WebviewWindow) {
     let _ = wdw.eval(INJECT_WIDE_CHAT_JS);
 }
 
-/// Re-apply the zoom the user last left the page at, since a fresh WebView2
-/// instance always starts at 1.0.
+/// Ask for the saved zoom to be put back on a webview that was just created,
+/// since a fresh WebView2 instance always starts at 1.0.
 ///
-/// A host-set zoom becomes the webview's new default: it survives navigation,
-/// and Ctrl+0 returns to it rather than to 100%.
+/// Deferred to the next poll that finds a live page rather than applied here:
+/// at creation the harness URL has not committed yet, and a zoom set on the
+/// document being navigated away from is lost with it.
 #[tauri::command]
-fn restore_dsh_zoom(app: AppHandle) {
+fn restore_dsh_zoom() {
+    ZOOM_RESTORE_PENDING.store(true, Ordering::SeqCst);
+}
+
+static ZOOM_RESTORE_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn apply_saved_zoom(app: &AppHandle) {
     let Some(wdw) = app.get_webview_window("dsh") else {
         return;
     };
-    let _ = wdw.set_zoom(clamp_zoom(load_settings(&app).zoom));
+    let zoom = clamp_zoom(load_settings(app).zoom);
+    // Logged rather than dropped: a silent failure here is exactly what makes
+    // the feature look like it never remembered anything.
+    if let Err(e) = wdw.set_zoom(zoom) {
+        eprintln!("dsh-desktop: could not restore zoom {zoom}: {e}");
+    }
 }
 
 #[cfg(windows)]
