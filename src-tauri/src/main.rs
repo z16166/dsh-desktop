@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[cfg(windows)]
@@ -193,6 +193,8 @@ enum LaunchSource {
 struct AppSettings {
     source: LaunchSource,
     local_path: String,
+    #[serde(default = "default_zoom")]
+    zoom: f64,
 }
 
 impl Default for AppSettings {
@@ -200,8 +202,13 @@ impl Default for AppSettings {
         Self {
             source: LaunchSource::Local,
             local_path: default_local_path(),
+            zoom: default_zoom(),
         }
     }
+}
+
+fn default_zoom() -> f64 {
+    1.0
 }
 
 fn default_local_path() -> String {
@@ -296,6 +303,72 @@ fn save_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), String> 
     let text = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("无法序列化设置：{e}"))?;
     std::fs::write(&path, text).map_err(|e| format!("无法写入设置：{e}"))
+}
+
+/// WebView2's own zoom range.
+const ZOOM_MIN: f64 = 0.25;
+const ZOOM_MAX: f64 = 5.0;
+/// Below this the two zooms are the same rung of the browser's ladder, so a
+/// reading that only differs by float noise does not rewrite the settings file.
+const ZOOM_EPSILON: f64 = 0.005;
+
+fn clamp_zoom(zoom: f64) -> f64 {
+    if !zoom.is_finite() {
+        return 1.0;
+    }
+    (zoom.clamp(ZOOM_MIN, ZOOM_MAX) * 100.0).round() / 100.0
+}
+
+/// Recover the zoom factor from the page's device pixel ratio, which is the
+/// monitor scale multiplied by that zoom. WebView2 owns the zoom hotkeys and
+/// Tauri exposes neither a getter nor a change event, so reading the ratio back
+/// out of the page is the only way to learn what the user picked.
+///
+/// An unusable probe reads as 1.0 rather than an error, and the caller only
+/// writes on a real change, so it cannot clobber the saved zoom either way.
+fn observed_zoom(device_pixel_ratio: Option<f64>, scale_factor: f64) -> f64 {
+    let Some(dpr) = device_pixel_ratio else {
+        return 1.0;
+    };
+    if !dpr.is_finite() || dpr <= 0.0 || !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return 1.0;
+    }
+    clamp_zoom(dpr / scale_factor)
+}
+
+fn zoom_changed(saved: f64, observed: f64) -> bool {
+    (saved - observed).abs() > ZOOM_EPSILON
+}
+
+/// Last device pixel ratio read from the page, as `f64::to_bits`. Zero means
+/// nothing has been read yet.
+static LAST_DPR: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a reading is a real move in the page's device pixel ratio, and so
+/// evidence that the user changed the zoom.
+///
+/// The saved zoom is only rewritten on such a move. Should a runtime ever stop
+/// folding its zoom factor into the ratio, the poll then leaves the setting
+/// alone instead of resetting it the first time it runs after launch.
+fn dpr_moved(previous: Option<f64>, current: f64) -> bool {
+    previous.is_some_and(|previous| (previous - current).abs() > 1e-6)
+}
+
+fn record_dpr(current: f64) -> bool {
+    let previous = match LAST_DPR.swap(current.to_bits(), Ordering::Relaxed) {
+        0 => None,
+        bits => Some(f64::from_bits(bits)),
+    };
+    dpr_moved(previous, current)
+}
+
+fn remember_dsh_zoom(app: &AppHandle, zoom: f64) {
+    let mut settings = load_settings(app);
+    if !zoom_changed(settings.zoom, zoom) {
+        return;
+    }
+    settings.zoom = zoom;
+    let _ = save_settings(app, &settings);
 }
 
 fn validate_local_repo(path: &str) -> Result<PathBuf, String> {
@@ -960,10 +1033,13 @@ fn get_settings(app: AppHandle) -> AppSettings {
 }
 
 #[tauri::command]
-fn set_settings(app: AppHandle, settings: AppSettings) -> Result<AppSettings, String> {
+fn set_settings(app: AppHandle, mut settings: AppSettings) -> Result<AppSettings, String> {
     if settings.source == LaunchSource::Local {
         validate_local_repo(&settings.local_path)?;
     }
+    // The zoom is observed from the page rather than edited in the settings UI,
+    // whose payload carries no zoom and would reset it to the serde default.
+    settings.zoom = load_settings(&app).zoom;
     save_settings(&app, &settings)?;
     Ok(settings)
 }
@@ -1155,6 +1231,11 @@ struct DshTheme {
     border: String,
     #[serde(default)]
     avoid: Option<DshAvoidRect>,
+    /// `window.devicePixelRatio`, read here because the theme poll is already
+    /// the one thing reaching into the page on a timer. Only the host reads it,
+    /// to recover the zoom factor, so it is not passed on to the frontend.
+    #[serde(default, skip_serializing)]
+    dpr: Option<f64>,
 }
 
 /// Header export capsule labels. Harness zh is `Session 日志`, not `Session log`.
@@ -1199,7 +1280,7 @@ const READ_DSH_THEME_JS: &str = r#"
         avoid = { x: r.left, y: r.top, w: r.width, h: r.height };
       }
     }
-    return { dark, bg, fg, border, avoid };
+    return { dark, bg, fg, border, avoid, dpr: window.devicePixelRatio };
   } catch (e) {
     return null;
   }
@@ -1213,6 +1294,7 @@ fn sync_dsh_theme(app: AppHandle) {
         return;
     };
     let app = app.clone();
+    let scale_factor = wdw.scale_factor().unwrap_or(1.0);
     let _ = wdw.eval_with_callback(READ_DSH_THEME_JS, move |json| {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
             return;
@@ -1220,11 +1302,25 @@ fn sync_dsh_theme(app: AppHandle) {
         if value.is_null() {
             return;
         }
-        let Ok(theme) = serde_json::from_value::<DshTheme>(value) else {
+        let Ok(mut theme) = serde_json::from_value::<DshTheme>(value) else {
             return;
         };
         if theme.bg.is_empty() {
             return;
+        }
+        let zoom = observed_zoom(theme.dpr, scale_factor);
+        if let Some(dpr) = theme.dpr.filter(|d| d.is_finite() && *d > 0.0) {
+            if record_dpr(dpr) {
+                remember_dsh_zoom(&app, zoom);
+            }
+        }
+        // The probe measures in CSS pixels; overlays are placed in logical
+        // pixels, and the zoom factor is the ratio between the two.
+        if let Some(avoid) = theme.avoid.as_mut() {
+            avoid.x *= zoom;
+            avoid.y *= zoom;
+            avoid.w *= zoom;
+            avoid.h *= zoom;
         }
         let _ = app.emit("dsh:theme", theme);
     });
@@ -1293,6 +1389,19 @@ fn inject_dsh_desktop_css(app: AppHandle) {
         return;
     };
     let _ = wdw.eval(INJECT_WIDE_CHAT_JS);
+}
+
+/// Re-apply the zoom the user last left the page at, since a fresh WebView2
+/// instance always starts at 1.0.
+///
+/// A host-set zoom becomes the webview's new default: it survives navigation,
+/// and Ctrl+0 returns to it rather than to 100%.
+#[tauri::command]
+fn restore_dsh_zoom(app: AppHandle) {
+    let Some(wdw) = app.get_webview_window("dsh") else {
+        return;
+    };
+    let _ = wdw.set_zoom(clamp_zoom(load_settings(&app).zoom));
 }
 
 #[cfg(windows)]
@@ -1912,6 +2021,7 @@ fn main() {
             dsh_version,
             sync_dsh_theme,
             inject_dsh_desktop_css,
+            restore_dsh_zoom,
             raise_overlay
         ])
         .setup(|app| {
@@ -1981,6 +2091,7 @@ mod tests {
         let settings = AppSettings {
             source: LaunchSource::Local,
             local_path: r"H:\github\deepseek-harness".to_string(),
+            zoom: 1.25,
         };
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains("\"source\":\"local\""));
@@ -1988,6 +2099,53 @@ mod tests {
         let parsed: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.source, LaunchSource::Local);
         assert_eq!(parsed.local_path, settings.local_path);
+        assert_eq!(parsed.zoom, 1.25);
+    }
+
+    #[test]
+    fn settings_written_before_zoom_existed_still_load() {
+        let parsed: AppSettings =
+            serde_json::from_str(r#"{"source":"npx","localPath":"H:\\repo"}"#).unwrap();
+        assert_eq!(parsed.zoom, 1.0);
+    }
+
+    #[test]
+    fn observed_zoom_divides_out_the_monitor_scale() {
+        // 125% zoom on a 150% display, and the same zoom on a 100% display.
+        assert_eq!(observed_zoom(Some(1.875), 1.5), 1.25);
+        assert_eq!(observed_zoom(Some(1.25), 1.0), 1.25);
+        // Chromium's 67% rung, which is 2/3 and needs rounding.
+        assert_eq!(observed_zoom(Some(0.666_666_666), 1.0), 0.67);
+    }
+
+    #[test]
+    fn observed_zoom_reads_an_unusable_probe_as_unzoomed() {
+        assert_eq!(observed_zoom(None, 1.5), 1.0);
+        assert_eq!(observed_zoom(Some(0.0), 1.5), 1.0);
+        assert_eq!(observed_zoom(Some(f64::NAN), 1.5), 1.0);
+        assert_eq!(observed_zoom(Some(1.5), 0.0), 1.0);
+    }
+
+    #[test]
+    fn observed_zoom_stays_within_webview2s_range() {
+        assert_eq!(observed_zoom(Some(40.0), 1.0), ZOOM_MAX);
+        assert_eq!(observed_zoom(Some(0.01), 1.0), ZOOM_MIN);
+    }
+
+    #[test]
+    fn the_first_reading_is_only_a_baseline() {
+        assert!(!dpr_moved(None, 1.25));
+        assert!(dpr_moved(Some(1.0), 1.25));
+        assert!(!dpr_moved(Some(1.25), 1.25));
+    }
+
+    #[test]
+    fn zoom_is_saved_only_when_the_user_moved_a_rung() {
+        assert!(zoom_changed(1.0, 1.1));
+        assert!(zoom_changed(1.25, 1.5));
+        // Float noise around one reading must not rewrite the settings file.
+        assert!(!zoom_changed(1.25, 1.25));
+        assert!(!zoom_changed(1.25, 1.2501));
     }
 
     #[test]
