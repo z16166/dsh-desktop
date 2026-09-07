@@ -412,34 +412,16 @@ async function showApp(): Promise<void> {
   }
   let wdw = await dshWindow();
   if (!wdw) {
-    const main = getCurrentWindow();
     const box = (await frameOverlayBox()) ?? { x: 0, y: 0, w: 800, h: 600 };
-    wdw = new WebviewWindow(DSH_LABEL, {
+    await invoke("create_dsh_window", {
       url: appUrl,
-      parent: main,
-      decorations: false,
-      skipTaskbar: true,
-      resizable: false,
-      shadow: false,
-      focus: false,
-      visible: false,
       x: Math.round(box.x),
       y: Math.round(box.y),
-      width: Math.round(box.w),
-      height: Math.round(box.h),
-      zoomHotkeysEnabled: true,
+      w: Math.round(box.w),
+      h: Math.round(box.h),
     });
-    await new Promise<void>((resolve, reject) => {
-      const t = window.setTimeout(() => reject(new Error("创建 dsh 窗口超时")), 8000);
-      wdw!.once("tauri://created", () => {
-        window.clearTimeout(t);
-        resolve();
-      });
-      wdw!.once("tauri://error", (e) => {
-        window.clearTimeout(t);
-        reject(e.payload ?? e);
-      });
-    });
+    wdw = await dshWindow();
+    if (!wdw) throw new Error("创建 dsh 窗口失败");
     // Only on creation: re-arming later would fight a zoom the poll that keeps
     // the setting current has not caught up with yet.
     void invoke("restore_dsh_zoom");
