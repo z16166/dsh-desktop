@@ -145,6 +145,51 @@ fn persist_window_state_for(label: &str) -> bool {
     label == "main"
 }
 
+fn browser_openable_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+}
+
+fn open_in_default_browser(url: &str) {
+    if !browser_openable_url(url) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        const SW_SHOWNORMAL: i32 = 1;
+        let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
+        let file: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let code = unsafe {
+            win32::ShellExecuteW(
+                0,
+                operation.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if code <= 32 {
+            eprintln!(
+                "dsh-desktop: could not open {url} in the default browser (ShellExecuteW={code})"
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 /// Tray commands. The toolbar entry is the escape hatch for a floating button
 /// that failed to surface: without it the CLI log tab is unreachable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1528,6 +1573,54 @@ fn restore_dsh_zoom() {
     ZOOM_RESTORE_PENDING.store(true, Ordering::SeqCst);
 }
 
+/// Create the harness overlay with an `on_new_window` handler.
+///
+/// Must be `async`: a blocking command runs inside the caller webview's IPC
+/// callback. Creating another WebView2 from that callback starves controller
+/// initialization — the overlay stays black, and later windows such as the
+/// quit card never paint. Tauri's own `create_webview_window` is async for
+/// the same reason.
+///
+/// See <https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/threading-model#reentrancy>
+#[tauri::command]
+async fn create_dsh_window(
+    app: AppHandle,
+    url: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> Result<(), String> {
+    if app.get_webview_window("dsh").is_some() {
+        return Ok(());
+    }
+    let parsed = url
+        .parse()
+        .map_err(|e| format!("无效的 harness URL：{e}"))?;
+    let Some(main) = app.get_webview_window("main") else {
+        return Err("找不到主窗口".to_string());
+    };
+    tauri::WebviewWindowBuilder::new(&app, "dsh", tauri::WebviewUrl::External(parsed))
+        .parent(&main)
+        .map_err(|e| format!("无法设置 dsh 窗口父级：{e}"))?
+        .inner_size(w, h)
+        .position(x, y)
+        .decorations(false)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .focused(false)
+        .visible(false)
+        .zoom_hotkeys_enabled(true)
+        .on_new_window(|url, _features| {
+            open_in_default_browser(url.as_str());
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .build()
+        .map_err(|e| format!("无法创建 dsh 窗口：{e}"))?;
+    Ok(())
+}
+
 static ZOOM_RESTORE_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn apply_saved_zoom(app: &AppHandle) {
@@ -1660,6 +1753,18 @@ mod win32 {
             l_param: isize,
             dw_flags: u32,
         ) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        pub fn ShellExecuteW(
+            hwnd: isize,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
     }
 }
 
@@ -2296,6 +2401,7 @@ fn main() {
             dsh_version,
             sync_dsh_theme,
             restore_dsh_zoom,
+            create_dsh_window,
             list_system_fonts,
             set_dsh_font,
             get_dsh_font,
@@ -2715,6 +2821,31 @@ mod tests {
         for label in OWNED_OVERLAY_LABELS {
             assert!(!persist_window_state_for(label));
         }
+    }
+
+    #[test]
+    fn browser_openable_url_allows_http_https_only() {
+        assert!(browser_openable_url(
+            "http://127.0.0.1:3080/?token=abc"
+        ));
+        assert!(browser_openable_url("https://github.com/foo"));
+        assert!(!browser_openable_url("javascript:alert(1)"));
+        assert!(!browser_openable_url("file:///C:/x"));
+        assert!(!browser_openable_url("data:text/html,x"));
+        assert!(!browser_openable_url("about:blank"));
+        assert!(!browser_openable_url(""));
+    }
+
+    #[test]
+    fn create_dsh_window_must_be_async_to_avoid_webview2_reentrancy() {
+        let production = include_str!("main.rs")
+            .split("mod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            production.contains("async fn create_dsh_window("),
+            "a blocking IPC command creates the overlay inside the caller webview's callback; WebView2 never finishes initializing"
+        );
     }
 
     #[test]
