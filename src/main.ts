@@ -5,6 +5,7 @@ import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
+  chromeCloseHidesBar,
   collapseChromeBeforeOverlay,
   sameBox,
   syncGeometryOnFocus,
@@ -142,13 +143,20 @@ function collapseChromeBar(): void {
   }
 }
 
+function syncChromeCloseButton(): void {
+  q<HTMLButtonElement>("#bar-close").hidden = !chromeCloseHidesBar(cliMode);
+}
+
 function hideChrome(): void {
-  if (cliMode) return;
-  collapseChromeBar();
+  if (!chromeCloseHidesBar(cliMode)) return;
+  if (chromeOpen()) {
+    topbar.classList.remove("open");
+  }
   void syncDshBounds();
 }
 
 function setupChrome(): void {
+  syncChromeCloseButton();
   q("#bar-close").addEventListener("click", () => {
     hideChrome();
   });
@@ -368,10 +376,12 @@ function setupTabs(): void {
       Object.keys(panels).forEach((k) => panels[k].classList.toggle("active", k === key));
       if (key === "cli") {
         cliMode = true;
+        syncChromeCloseButton();
         showChrome();
         void hideDshWindow();
       } else {
         cliMode = false;
+        syncChromeCloseButton();
         if (ready) void showApp();
       }
     });

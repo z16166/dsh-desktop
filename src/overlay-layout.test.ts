@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  chromeCloseHidesBar,
   collapseChromeBeforeOverlay,
   sameBox,
   syncGeometryOnFocus,
@@ -20,6 +21,11 @@ test("sameBox ignores sub-pixel jitter", () => {
 test("app tab collapses chrome before creating the overlay", () => {
   assert.equal(collapseChromeBeforeOverlay(false), true);
   assert.equal(collapseChromeBeforeOverlay(true), false);
+});
+
+test("toolbar close is only available on the app tab", () => {
+  assert.equal(chromeCloseHidesBar(false), true);
+  assert.equal(chromeCloseHidesBar(true), false);
 });
 
 test("focus must not retrigger overlay geometry", () => {
