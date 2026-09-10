@@ -663,6 +663,17 @@ fn base_tool_cmd(tool: &str) -> Command {
     c
 }
 
+/// Capture child logs without inheriting the GUI process stdin.
+///
+/// After `FreeConsole` (used to Ctrl+C the hidden dsh console),
+/// `GetStdHandle(STD_INPUT)` often still returns a closed handle.
+/// Piped `Command::spawn` then fails with ERROR_INVALID_HANDLE (os error 6).
+fn apply_captured_stdio(cmd: &mut Command) {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+}
+
 /// Windows: keep helper consoles hidden (git / pnpm / taskkill).
 #[cfg(windows)]
 fn hide_console(c: &mut Command) {
@@ -957,11 +968,23 @@ fn wait_for_dsh_stop(pid: u32, timeout: Duration) -> bool {
     }
 }
 
+/// `FreeConsole` does not clear the PEB std handles. Leave them null so a
+/// later `Command::spawn` does not `DuplicateHandle` a closed console handle.
+#[cfg(windows)]
+fn forget_console_stdio() {
+    unsafe {
+        let _ = win32::SetStdHandle(win32::STD_INPUT_HANDLE, 0);
+        let _ = win32::SetStdHandle(win32::STD_OUTPUT_HANDLE, 0);
+        let _ = win32::SetStdHandle(win32::STD_ERROR_HANDLE, 0);
+    }
+}
+
 #[cfg(windows)]
 fn send_ctrl_c(pid: u32) -> bool {
     unsafe {
         // Debug `cargo run` attaches a console; AttachConsole fails until we drop it.
         let _ = win32::FreeConsole();
+        forget_console_stdio();
         if win32::AttachConsole(pid) == 0 {
             return false;
         }
@@ -970,6 +993,7 @@ fn send_ctrl_c(pid: u32) -> bool {
         let sent = win32::GenerateConsoleCtrlEvent(0, 0) != 0;
         std::thread::sleep(Duration::from_millis(150));
         let _ = win32::FreeConsole();
+        forget_console_stdio();
         win32::SetConsoleCtrlHandler(None, 0);
         sent
     }
@@ -998,6 +1022,9 @@ fn force_kill_tree(pid: u32) {
         let mut c = Command::new("taskkill");
         c.args(["/PID", &pid.to_string(), "/T", "/F"]);
         hide_console(&mut c);
+        c.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let _ = c.status();
     }
 }
@@ -1070,7 +1097,7 @@ fn start_internal(app: &AppHandle) -> Result<Status, String> {
 
     let settings = load_settings(app);
     let mut cmd = dsh_command(&settings)?;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    apply_captured_stdio(&mut cmd);
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -1207,7 +1234,7 @@ fn run_logged_command(
     mut cmd: Command,
     collected: &std::sync::Arc<Mutex<Vec<String>>>,
 ) -> Result<bool, String> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    apply_captured_stdio(&mut cmd);
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -1317,7 +1344,9 @@ async fn upgrade_dsh(app: AppHandle) -> Result<UpgradeResult, String> {
 async fn dsh_version(app: AppHandle) -> Result<String, String> {
     let settings = load_settings(&app);
     let mut cmd = version_command(&settings)?;
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     #[cfg(unix)]
     {
         cmd.process_group(0);
@@ -1642,6 +1671,10 @@ static PICKER_HWND: AtomicIsize = AtomicIsize::new(0);
 
 #[cfg(windows)]
 mod win32 {
+    pub const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    pub const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    pub const STD_ERROR_HANDLE: u32 = (-12i32) as u32;
+
     #[repr(C)]
     pub struct ProcessEntry32W {
         pub dw_size: u32,
@@ -1737,6 +1770,8 @@ mod win32 {
         pub fn GetExitCodeProcess(handle: isize, exit_code: *mut u32) -> i32;
         pub fn AttachConsole(process_id: u32) -> i32;
         pub fn FreeConsole() -> i32;
+        pub fn GetStdHandle(n_std_handle: u32) -> isize;
+        pub fn SetStdHandle(n_std_handle: u32, h_handle: isize) -> i32;
         pub fn SetConsoleCtrlHandler(
             handler: Option<unsafe extern "system" fn(u32) -> i32>,
             add: i32,
@@ -2878,5 +2913,51 @@ mod tests {
             is_web_ready(port),
             "boot HTML plus /api/events.host 426 must count as ready"
         );
+    }
+
+    /// `FreeConsole` leaves `GetStdHandle(STD_INPUT)` returning a closed handle.
+    /// Piped `Command::spawn` then fails with os error 6 unless stdin is not
+    /// inherited. This is the stop-then-start failure of the GUI wrapper.
+    #[cfg(windows)]
+    #[test]
+    fn apply_captured_stdio_spawns_when_inherited_stdin_is_stale() {
+        use std::fs::File;
+        use std::os::windows::io::AsRawHandle;
+
+        struct RestoreStdin(isize);
+        impl Drop for RestoreStdin {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = win32::SetStdHandle(win32::STD_INPUT_HANDLE, self.0);
+                }
+            }
+        }
+
+        let prev = unsafe { win32::GetStdHandle(win32::STD_INPUT_HANDLE) };
+        let _restore = RestoreStdin(prev);
+        let nul = File::open("NUL").expect("open NUL");
+        let stale = nul.as_raw_handle() as isize;
+        drop(nul);
+        unsafe {
+            assert_ne!(win32::SetStdHandle(win32::STD_INPUT_HANDLE, stale), 0);
+        }
+
+        let inherited = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        assert!(
+            inherited.is_err(),
+            "stale inherited stdin must fail spawn, got {inherited:?}"
+        );
+
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "exit", "0"]);
+        apply_captured_stdio(&mut cmd);
+        let mut child = cmd
+            .spawn()
+            .expect("captured stdio must spawn with a stale inherited stdin");
+        assert!(child.wait().unwrap().success());
     }
 }
