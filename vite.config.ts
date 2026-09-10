@@ -18,7 +18,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: resolve(root, "index.html"),
-        "chrome-btn": resolve(root, "chrome-btn.html"),
         quit: resolve(root, "quit.html"),
         font: resolve(root, "font.html"),
       },

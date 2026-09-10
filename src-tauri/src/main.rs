@@ -56,10 +56,6 @@ fn pid_is_under_root_with(pid: u32, root: u32, parent_of: impl Fn(u32) -> Option
     false
 }
 
-fn allow_overlay_z_raise(picker_showing: bool, foreground_is_ours: bool) -> bool {
-    !picker_showing && foreground_is_ours
-}
-
 /// The class every `IFileOpenDialog` carries.
 const DIALOG_CLASS: &str = "#32770";
 
@@ -139,7 +135,7 @@ struct ShellState {
     withdrawn: AtomicBool,
 }
 
-const OWNED_OVERLAY_LABELS: [&str; 2] = ["dsh", "chrome-btn"];
+const OWNED_OVERLAY_LABELS: [&str; 1] = ["dsh"];
 
 fn persist_window_state_for(label: &str) -> bool {
     label == "main"
@@ -228,6 +224,7 @@ fn minimize_transition(was_minimized: bool, is_minimized: bool) -> MinimizeTrans
     }
 }
 
+#[cfg(test)]
 fn should_show_owned_overlay(main_minimized: bool, main_visible: bool) -> bool {
     main_visible && !main_minimized
 }
@@ -1370,48 +1367,21 @@ fn server_status(app: AppHandle) -> Status {
     status_of(&app, running)
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct DshAvoidRect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct DshTheme {
-    dark: bool,
     bg: String,
-    fg: String,
-    border: String,
-    #[serde(default)]
-    avoid: Option<DshAvoidRect>,
     /// `window.devicePixelRatio`, read here because the theme poll is already
-    /// the one thing reaching into the page on a timer. Only the host reads it,
-    /// to recover the zoom factor, so it is not passed on to the frontend.
-    #[serde(default, skip_serializing)]
+    /// the one thing reaching into the page on a timer. Used to recover zoom.
+    #[serde(default)]
     dpr: Option<f64>,
     /// Whether our own CSS is still on the page. False on the first poll and
     /// after a reload, which is the only time it is worth injecting again.
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     styled: bool,
     /// The family the page is currently forced to, `-` when the probe found
-    /// nothing, empty when the script has never run. Host-side only.
-    #[serde(default, skip_serializing)]
+    /// nothing, empty when the script has never run.
+    #[serde(default)]
     font: String,
-}
-
-/// Header export capsule labels. Harness zh is `Session 日志`, not `Session log`.
-/// Kept next to `READ_DSH_THEME_JS` so the probe and tests share one list.
-#[cfg(test)]
-const SESSION_EXPORT_LABELS: &[&str] = &["Session log", "Session 日志"];
-
-#[cfg(test)]
-fn session_export_anchor_matches(text: &str) -> bool {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    SESSION_EXPORT_LABELS
-        .iter()
-        .any(|label| normalized == *label || normalized.starts_with(label))
 }
 
 const READ_DSH_THEME_JS: &str = r#"
@@ -1425,34 +1395,9 @@ const READ_DSH_THEME_JS: &str = r#"
       || token("--dsw-alias-bg-layer-2")
       || token("--dsw-specific-sidebar-fill")
       || cs.backgroundColor;
-    const fg = token("--dsw-alias-label-primary") || cs.color;
-    const border = token("--dsw-alias-border-l2")
-      || token("--dsw-alias-border-l1")
-      || "transparent";
-    const dark = body.hasAttribute("data-ds-dark-theme")
-      || document.documentElement.style.colorScheme === "dark";
-    const labels = ["Session log", "Session 日志"];
-    const norm = (el) => (el.textContent || "").replace(/\s+/g, " ").trim();
-    const match = (el) => labels.some((l) => { const t = norm(el); return t === l || t.startsWith(l); });
-    // Cached across polls: scanning every button in a long conversation is by
-    // far the costliest thing here, and the capsule outlives the scan.
-    let sessionLog = window.__dshDesktopAnchor;
-    if (!sessionLog || !sessionLog.isConnected || !match(sessionLog)) {
-      sessionLog = Array.from(document.querySelectorAll("header button")).find(match)
-        || Array.from(document.querySelectorAll("button")).find(match)
-        || null;
-      window.__dshDesktopAnchor = sessionLog;
-    }
-    let avoid = null;
-    if (sessionLog) {
-      const r = sessionLog.getBoundingClientRect();
-      if (r.width > 0 && r.height > 0) {
-        avoid = { x: r.left, y: r.top, w: r.width, h: r.height };
-      }
-    }
     const styled = document.documentElement.classList.contains("dsh-desktop-wide-chat");
     const font = document.documentElement.dataset.dshDesktopFont || "";
-    return { dark, bg, fg, border, avoid, dpr: window.devicePixelRatio, styled, font };
+    return { bg, dpr: window.devicePixelRatio, styled, font };
   } catch (e) {
     return null;
   }
@@ -1474,7 +1419,7 @@ fn sync_dsh_theme(app: AppHandle) {
         if value.is_null() {
             return;
         }
-        let Ok(mut theme) = serde_json::from_value::<DshTheme>(value) else {
+        let Ok(theme) = serde_json::from_value::<DshTheme>(value) else {
             return;
         };
         if theme.bg.is_empty() {
@@ -1497,15 +1442,6 @@ fn sync_dsh_theme(app: AppHandle) {
         } else if moved {
             remember_dsh_zoom(&app, zoom);
         }
-        // The probe measures in CSS pixels; overlays are placed in logical
-        // pixels, and the zoom factor is the ratio between the two.
-        if let Some(avoid) = theme.avoid.as_mut() {
-            avoid.x *= zoom;
-            avoid.y *= zoom;
-            avoid.w *= zoom;
-            avoid.h *= zoom;
-        }
-        let _ = app.emit("dsh:theme", theme);
     });
 }
 
@@ -1882,14 +1818,6 @@ fn apply_tool_window_hwnd(hwnd: isize) {
 }
 
 #[cfg(windows)]
-fn apply_tool_window_style(wdw: &tauri::WebviewWindow) {
-    let Ok(hwnd) = wdw.hwnd() else {
-        return;
-    };
-    apply_tool_window_hwnd(hwnd.0 as isize);
-}
-
-#[cfg(windows)]
 fn window_pid(hwnd: isize) -> u32 {
     let mut pid = 0u32;
     unsafe {
@@ -1923,12 +1851,6 @@ fn foreground_is_ours() -> bool {
         let fg = win32::GetForegroundWindow();
         fg != 0 && window_pid(fg) == win32::GetCurrentProcessId()
     }
-}
-
-#[cfg(windows)]
-fn picker_is_showing() -> bool {
-    let hwnd = PICKER_HWND.load(Ordering::SeqCst);
-    hwnd != 0 && is_visible_toplevel(hwnd)
 }
 
 #[cfg(windows)]
@@ -2075,41 +1997,6 @@ fn install_dialog_zorder_hook() {
     }
 }
 
-#[cfg(windows)]
-fn raise_win32(wdw: &tauri::WebviewWindow) {
-    let Ok(hwnd) = wdw.hwnd() else {
-        return;
-    };
-    const SWP_NOSIZE: u32 = 0x0001;
-    const SWP_NOMOVE: u32 = 0x0002;
-    const SWP_NOACTIVATE: u32 = 0x0010;
-    const SWP_NOOWNERZORDER: u32 = 0x0200;
-    unsafe {
-        win32::SetWindowPos(
-            hwnd.0 as isize,
-            0,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-        );
-    }
-}
-
-fn overlays_allowed(app: &AppHandle) -> bool {
-    let withdrawn = app.state::<ShellState>().withdrawn.load(Ordering::SeqCst);
-    if withdrawn {
-        return false;
-    }
-    let Some(main) = app.get_webview_window("main") else {
-        return false;
-    };
-    let visible = main.is_visible().unwrap_or(false);
-    let minimized = main.is_minimized().unwrap_or(false);
-    should_show_owned_overlay(minimized, visible)
-}
-
 fn hide_owned_overlays(app: &AppHandle) {
     for label in OWNED_OVERLAY_LABELS {
         if let Some(wdw) = app.get_webview_window(label) {
@@ -2132,29 +2019,6 @@ fn handle_main_minimize_event(app: &AppHandle, is_minimized: bool) {
             let _ = app.emit("app:restore", ());
         }
     }
-}
-
-/// Show `label` above sibling webviews (dsh) without recreating it.
-#[tauri::command]
-fn raise_overlay(app: AppHandle, label: String) {
-    if !overlays_allowed(&app) {
-        return;
-    }
-    // Reached on every focus change of the Harness webview, so it only reads
-    // window state: rescanning the desktop for dialogs to lift from here is
-    // what stole the caret out of the composer.
-    #[cfg(windows)]
-    if !allow_overlay_z_raise(picker_is_showing(), foreground_is_ours()) {
-        return;
-    }
-    let Some(wdw) = app.get_webview_window(&label) else {
-        return;
-    };
-    #[cfg(windows)]
-    apply_tool_window_style(&wdw);
-    let _ = wdw.show();
-    #[cfg(windows)]
-    raise_win32(&wdw);
 }
 
 /// True when the process token is elevated (launched via UAC / as administrator).
@@ -2439,8 +2303,7 @@ fn main() {
             create_dsh_window,
             list_system_fonts,
             set_dsh_font,
-            get_dsh_font,
-            raise_overlay
+            get_dsh_font
         ])
         .setup(|app| {
             #[cfg(windows)]
@@ -2459,7 +2322,7 @@ fn main() {
             #[cfg(windows)]
             if let Ok(hwnd) = window.hwnd() {
                 let hwnd = hwnd.0 as isize;
-                if matches!(window.label(), "dsh" | "chrome-btn") {
+                if window.label() == "dsh" {
                     apply_tool_window_hwnd(hwnd);
                 }
             }
@@ -2468,8 +2331,6 @@ fn main() {
                     if window.label() == "main" {
                         api.prevent_close();
                         hide_to_tray(window.app_handle());
-                    } else if window.label() == "chrome-btn" {
-                        api.prevent_close();
                     }
                 }
                 tauri::WindowEvent::Resized(_)
@@ -2686,18 +2547,14 @@ mod tests {
     }
 
     #[test]
-    fn session_export_anchor_matches_localized_header_labels() {
-        assert!(session_export_anchor_matches("Session log"));
-        assert!(session_export_anchor_matches("Session 日志"));
-        assert!(session_export_anchor_matches("\n  Session 日志\n"));
-        assert!(!session_export_anchor_matches("Session"));
-        assert!(!session_export_anchor_matches("导出 Session"));
-        for label in SESSION_EXPORT_LABELS {
-            assert!(
-                READ_DSH_THEME_JS.contains(label),
-                "theme probe must keep {label} in sync with session_export_anchor_matches"
-            );
-        }
+    fn theme_probe_does_not_scan_the_page_for_a_toolbar_button_anchor() {
+        assert!(
+            !READ_DSH_THEME_JS.contains("__dshDesktopAnchor"),
+            "chrome-btn positioning used a Session-export capsule that moved with harness updates"
+        );
+        assert!(!READ_DSH_THEME_JS.contains("Session log"));
+        assert!(!READ_DSH_THEME_JS.contains("Session 日志"));
+        assert!(!READ_DSH_THEME_JS.contains("avoid"));
     }
 
     #[test]
@@ -2724,14 +2581,6 @@ mod tests {
         assert!(pid_is_under_root_with(10, 10, parent_of));
         assert!(!pid_is_under_root_with(30, 99, parent_of));
         assert!(!pid_is_under_root_with(1, 10, parent_of));
-    }
-
-    #[test]
-    fn overlay_z_raise_yields_to_foreign_picker_and_other_apps() {
-        assert!(allow_overlay_z_raise(false, true));
-        assert!(!allow_overlay_z_raise(true, true));
-        assert!(!allow_overlay_z_raise(false, false));
-        assert!(!allow_overlay_z_raise(true, false));
     }
 
     #[test]
@@ -2814,7 +2663,7 @@ mod tests {
             "hide-to-tray must not resurrect the frameless dsh overlay"
         );
         assert!(should_show_owned_overlay(false, true));
-        assert_eq!(OWNED_OVERLAY_LABELS, ["dsh", "chrome-btn"]);
+        assert_eq!(OWNED_OVERLAY_LABELS, ["dsh"]);
     }
 
     #[test]

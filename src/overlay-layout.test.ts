@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  chromeBtnReadyToShow,
   collapseChromeBeforeOverlay,
   sameBox,
   syncGeometryOnFocus,
@@ -25,11 +24,4 @@ test("app tab collapses chrome before creating the overlay", () => {
 
 test("focus must not retrigger overlay geometry", () => {
   assert.equal(syncGeometryOnFocus(), false);
-});
-
-test("chrome button waits for the Session export capsule, then falls back", () => {
-  assert.equal(chromeBtnReadyToShow(null, 0, 2500), false);
-  assert.equal(chromeBtnReadyToShow({ w: 0, h: 0 }, 400, 2500), false);
-  assert.equal(chromeBtnReadyToShow({ w: 111, h: 32 }, 100, 2500), true);
-  assert.equal(chromeBtnReadyToShow(null, 2500, 2500), true);
 });

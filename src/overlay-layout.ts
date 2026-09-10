@@ -18,13 +18,3 @@ export function collapseChromeBeforeOverlay(cliMode: boolean): boolean {
 export function syncGeometryOnFocus(): boolean {
   return false;
 }
-
-/** Show the chrome button once the Session export capsule is measured, or after fallback. */
-export function chromeBtnReadyToShow(
-  avoid: { w: number; h: number } | null | undefined,
-  waitedMs: number,
-  fallbackMs: number,
-): boolean {
-  if (avoid && avoid.w > 0 && avoid.h > 0) return true;
-  return waitedMs >= fallbackMs;
-}
