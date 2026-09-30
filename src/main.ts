@@ -226,7 +226,12 @@ async function onMainFocusChanged(): Promise<void> {
 /** Putting the overlay back on screen has to restart the poll that hiding it
  * stopped, so the two always travel together. */
 async function showDshWindow(wdw: WebviewWindow): Promise<void> {
-  if (!(await wdw.isVisible())) await wdw.show();
+  // Unconditional on purpose. `isVisible()` can already report true because Windows
+  // re-shows this owned window by itself when the main window comes back from
+  // minimized; skipping `show()` then leaves Tauri's cached visibility flag stale, and
+  // the next close-to-tray silently fails to hide the overlay (it stays painted over
+  // the desktop). `show()` on an already-visible window is a no-op, so always call it.
+  await wdw.show();
   startThemeSync();
 }
 

@@ -1665,6 +1665,7 @@ mod win32 {
             cy: i32,
             flags: u32,
         ) -> i32;
+        pub fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
         pub fn GetWindowLongW(hwnd: isize, n_index: i32) -> i32;
         pub fn SetWindowLongW(hwnd: isize, n_index: i32, dw_new_long: i32) -> i32;
         pub fn GetClassNameW(hwnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
@@ -1997,10 +1998,33 @@ fn install_dialog_zorder_hook() {
     }
 }
 
+/// `SW_HIDE`.
+#[cfg(windows)]
+const SW_HIDE: i32 = 0;
+
+/// Hide a window and make sure the OS agrees.
+///
+/// Tauri only reaches `ShowWindow(SW_HIDE)` when tao's cached `VISIBLE` flag flips, and
+/// that cache goes stale: Windows re-shows an owned window by itself when its owner comes
+/// back from minimized, so the overlay is on screen while tao still believes it is
+/// hidden. `hide()` is then a silent no-op and the frameless `dsh` window stays painted
+/// over the desktop after close-to-tray. Verify instead of trusting the cache.
+fn hide_window_and_verify(wdw: &tauri::WebviewWindow) {
+    let _ = wdw.hide();
+    #[cfg(windows)]
+    if wdw.is_visible().unwrap_or(false) {
+        if let Ok(hwnd) = wdw.hwnd() {
+            unsafe {
+                let _ = win32::ShowWindow(hwnd.0 as isize, SW_HIDE);
+            }
+        }
+    }
+}
+
 fn hide_owned_overlays(app: &AppHandle) {
     for label in OWNED_OVERLAY_LABELS {
         if let Some(wdw) = app.get_webview_window(label) {
-            let _ = wdw.hide();
+            hide_window_and_verify(&wdw);
         }
     }
 }
@@ -2087,7 +2111,7 @@ fn hide_to_tray(app: &AppHandle) {
     let _ = app.emit("app:withdraw", ());
     hide_owned_overlays(app);
     if let Some(main) = app.get_webview_window("main") {
-        let _ = main.hide();
+        hide_window_and_verify(&main);
     }
 }
 
@@ -2664,6 +2688,24 @@ mod tests {
         );
         assert!(should_show_owned_overlay(false, true));
         assert_eq!(OWNED_OVERLAY_LABELS, ["dsh"]);
+    }
+
+    #[test]
+    fn hiding_an_owned_overlay_is_verified_against_the_os() {
+        let production = include_str!("main.rs")
+            .split("mod tests {")
+            .next()
+            .unwrap();
+        assert!(
+            production.contains("fn hide_window_and_verify("),
+            "tao's hide() is a no-op once its cached VISIBLE flag is stale — Windows re-shows \
+             the owned dsh window on its own when main returns from minimized — so every hide \
+             that must land has to fall back to ShowWindow(SW_HIDE)"
+        );
+        assert!(
+            production.contains("let _ = win32::ShowWindow(hwnd.0 as isize, SW_HIDE)"),
+            "the fallback has to be the native call, not a second Tauri hide()"
+        );
     }
 
     #[test]
