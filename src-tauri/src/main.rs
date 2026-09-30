@@ -2029,6 +2029,49 @@ fn hide_owned_overlays(app: &AppHandle) {
     }
 }
 
+/// Hide the frameless overlay on the page's behalf (CLI tab, geometry changes).
+///
+/// The page's own `WebviewWindow::hide()` hits the same stale-cache no-op the close path
+/// does, which would leave the harness page painted over the CLI log; route it through
+/// the hide that verifies against the OS instead.
+#[tauri::command]
+fn hide_dsh_window(app: AppHandle) {
+    if let Some(wdw) = app.get_webview_window("dsh") {
+        hide_window_and_verify(&wdw);
+    }
+}
+
+/// `SW_SHOWNOACTIVATE`.
+#[cfg(windows)]
+const SW_SHOWNOACTIVATE: i32 = 4;
+
+/// Bring the frameless overlay up without letting it take the foreground.
+///
+/// Tauri's `show()` ends in `ShowWindow(SW_SHOW)`, which activates the window, and the
+/// non-activating path tao uses for a window created with `focused(false)` is one-shot:
+/// every show after the first hands the foreground to this taskbar-less tool window, so
+/// the shell looks like a background window even though the app is the active one.
+/// Showing it natively keeps the shell active, and pairs with `hide_window_and_verify`,
+/// which is what makes the overlay's visibility ours to decide instead of tao's cached
+/// flag — the same flag that made hiding a no-op in the first place.
+#[tauri::command]
+fn show_dsh_window(app: AppHandle) {
+    let Some(wdw) = app.get_webview_window("dsh") else {
+        return;
+    };
+    if wdw.is_visible().unwrap_or(false) {
+        return;
+    }
+    #[cfg(windows)]
+    if let Ok(hwnd) = wdw.hwnd() {
+        unsafe {
+            let _ = win32::ShowWindow(hwnd.0 as isize, SW_SHOWNOACTIVATE);
+        }
+        return;
+    }
+    let _ = wdw.show();
+}
+
 fn handle_main_minimize_event(app: &AppHandle, is_minimized: bool) {
     let state = app.state::<ShellState>();
     if state.withdrawn.load(Ordering::SeqCst) {
@@ -2325,6 +2368,8 @@ fn main() {
             sync_dsh_theme,
             restore_dsh_zoom,
             create_dsh_window,
+            show_dsh_window,
+            hide_dsh_window,
             list_system_fonts,
             set_dsh_font,
             get_dsh_font
@@ -2705,6 +2750,17 @@ mod tests {
         assert!(
             production.contains("let _ = win32::ShowWindow(hwnd.0 as isize, SW_HIDE)"),
             "the fallback has to be the native call, not a second Tauri hide()"
+        );
+        assert!(
+            production.contains("fn hide_dsh_window("),
+            "the page hides the overlay for the CLI tab too; that hide needs the same \
+             verification, so it goes through a command instead of WebviewWindow::hide()"
+        );
+        assert!(
+            production.contains("let _ = win32::ShowWindow(hwnd.0 as isize, SW_SHOWNOACTIVATE)"),
+            "showing the overlay has to be non-activating: tao's show() is ShowWindow(SW_SHOW), \
+             and its one-shot non-activating path leaves every later show stealing the shell's \
+             foreground"
         );
     }
 

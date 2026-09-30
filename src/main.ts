@@ -203,7 +203,7 @@ async function onMainGeometryChanged(): Promise<void> {
   }
   if (ready && !cliMode) {
     const wdw = await dshWindow();
-    if (wdw) await showDshWindow(wdw);
+    if (wdw) await showDshWindow();
   }
   await syncDshBounds();
 }
@@ -219,26 +219,29 @@ async function onMainFocusChanged(): Promise<void> {
   }
   if (ready && !cliMode) {
     const wdw = await dshWindow();
-    if (wdw) await showDshWindow(wdw);
+    if (wdw) await showDshWindow();
   }
 }
 
 /** Putting the overlay back on screen has to restart the poll that hiding it
  * stopped, so the two always travel together. */
-async function showDshWindow(wdw: WebviewWindow): Promise<void> {
-  // Unconditional on purpose. `isVisible()` can already report true because Windows
-  // re-shows this owned window by itself when the main window comes back from
-  // minimized; skipping `show()` then leaves Tauri's cached visibility flag stale, and
-  // the next close-to-tray silently fails to hide the overlay (it stays painted over
-  // the desktop). `show()` on an already-visible window is a no-op, so always call it.
-  await wdw.show();
+async function showDshWindow(): Promise<void> {
+  // Both halves of the overlay's visibility go through Rust rather than Tauri's own
+  // show()/hide(): show() is `ShowWindow(SW_SHOW)` and hands the foreground to this
+  // taskbar-less tool window (so the shell looks like a background window), while hide()
+  // silently does nothing once tao's cached visibility flag is stale (so the harness
+  // page stays painted on top). The commands go by what the OS reports instead.
+  await invoke("show_dsh_window");
   startThemeSync();
 }
 
 async function hideDshWindow(): Promise<void> {
   stopThemeSync();
-  const wdw = await dshWindow();
-  if (wdw) await wdw.hide();
+  // Through Rust rather than `wdw.hide()`: tao skips `ShowWindow(SW_HIDE)` once its
+  // cached visibility flag says hidden, which is the state Windows leaves behind when
+  // it re-shows this owned window on its own. A skipped hide paints the harness page
+  // over whatever is underneath, so every hide goes through the verified path.
+  await invoke("hide_dsh_window");
 }
 
 async function closeDshWindow(): Promise<void> {
@@ -272,7 +275,7 @@ async function showApp(): Promise<void> {
     appendLog("> 已用独立窗口加载 Web UI（避免 iframe 跨站拦截插件）", "sys");
   }
   await syncDshBounds();
-  await showDshWindow(wdw);
+  await showDshWindow();
 }
 
 function launchCommandLabel(): string {
