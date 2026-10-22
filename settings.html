@@ -36,9 +36,10 @@
       <pre class="log" id="log"></pre>
       <section class="font-pane">
         <h2>字体</h2>
-        <input type="search" id="font-search" placeholder="搜索字体…" autocomplete="off" />
-        <p id="font-status">正在读取系统字体…</p>
-        <div id="font-list" role="listbox" aria-label="系统字体"></div>
+        <p id="font-status">当前字体：…</p>
+        <button type="button" id="font-load">选择字体</button>
+        <input type="search" id="font-search" placeholder="搜索字体…" autocomplete="off" hidden />
+        <div id="font-list" role="listbox" aria-label="系统字体" hidden></div>
         <div id="font-preview">DeepSeek Harness 字体预览 0123456789 The quick brown fox</div>
         <div class="font-actions">
           <button type="button" id="font-apply" class="primary">应用字体</button>

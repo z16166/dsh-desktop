@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { filterFontFamilies } from "./font-filter";
+import { currentFontStatus } from "./font-status";
 
 const AUTO_LABEL = "（自动：霞鹜文楷）";
 const PREVIEW_SAMPLE = "DeepSeek Harness 字体预览 0123456789 The quick brown fox";
@@ -10,10 +11,13 @@ export function mountFontPicker(opts: { onApplied?: (name: string) => void } = {
   const list = document.getElementById("font-list") as HTMLDivElement;
   const preview = document.getElementById("font-preview") as HTMLDivElement;
   const applyBtn = document.getElementById("font-apply") as HTMLButtonElement;
+  const loadBtn = document.getElementById("font-load") as HTMLButtonElement;
 
   let families: string[] = [];
   let selected = "";
   let observer: IntersectionObserver | null = null;
+  let listed = false;
+  let listing = false;
 
   function previewFamily(name: string): void {
     preview.style.fontFamily = name ? JSON.stringify(name) : "";
@@ -81,7 +85,35 @@ export function mountFontPicker(opts: { onApplied?: (name: string) => void } = {
     }
   }
 
-  search.addEventListener("input", () => paint(false));
+  function showCurrent(): void {
+    status.textContent = currentFontStatus(selected);
+    previewFamily(selected);
+  }
+
+  async function loadFontList(): Promise<void> {
+    if (listed || listing) return;
+    listing = true;
+    loadBtn.disabled = true;
+    status.textContent = "正在读取系统字体…";
+    try {
+      families = await invoke<string[]>("list_system_fonts");
+      listed = true;
+      loadBtn.hidden = true;
+      search.hidden = false;
+      list.hidden = false;
+      paint(true);
+    } catch (e) {
+      status.textContent = "无法读取系统字体：" + String(e);
+      loadBtn.disabled = false;
+    } finally {
+      listing = false;
+    }
+  }
+
+  search.addEventListener("input", () => {
+    if (listed) paint(false);
+  });
+  loadBtn.addEventListener("click", () => void loadFontList());
   applyBtn.addEventListener("click", () => {
     void (async () => {
       applyBtn.disabled = true;
@@ -100,13 +132,15 @@ export function mountFontPicker(opts: { onApplied?: (name: string) => void } = {
   void (async () => {
     try {
       selected = await invoke<string>("get_dsh_font");
-      families = await invoke<string[]>("list_system_fonts");
     } catch (e) {
-      status.textContent = "无法读取系统字体：" + String(e);
-      previewFamily(selected);
+      if (!listed && !listing) {
+        status.textContent = "无法读取当前字体：" + String(e);
+        previewFamily("");
+      }
       return;
     }
-    previewFamily(selected);
-    paint(true);
+    if (listed) paint(true);
+    else if (!listing) showCurrent();
+    else previewFamily(selected);
   })();
 }

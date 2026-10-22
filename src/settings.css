@@ -69,7 +69,7 @@ body {
   background: var(--bg-2);
   border-bottom: 1px solid var(--border);
 }
-.toolbar button, .font-actions button {
+.toolbar button, .font-actions button, #font-load {
   background: var(--bg-3);
   color: var(--fg);
   border: 1px solid var(--border);
@@ -78,8 +78,9 @@ body {
   cursor: pointer;
   font-size: 13px;
 }
-.toolbar button:hover, .font-actions button:hover { border-color: var(--accent); }
-.toolbar button:disabled, .font-actions button:disabled { opacity: 0.5; cursor: default; }
+.toolbar button:hover, .font-actions button:hover, #font-load:hover { border-color: var(--accent); }
+.toolbar button:disabled, .font-actions button:disabled, #font-load:disabled { opacity: 0.5; cursor: default; }
+#font-load { align-self: flex-start; margin-bottom: 8px; }
 .toolbar select, .toolbar input[type="text"], .font-pane input[type="search"] {
   background: var(--bg-3);
   color: var(--fg);
