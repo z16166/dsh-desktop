@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>设置</title>
+    <script type="module" src="/src/settings.ts"></script>
+  </head>
+  <body>
+    <header class="head">
+      <div class="brand">
+        <span class="title">设置</span>
+        <span class="version" id="version">dsh …</span>
+      </div>
+      <div class="status">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">正在连接…</span>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <button id="btn-start" type="button">启动</button>
+      <button id="btn-stop" type="button">停止</button>
+      <button id="btn-restart" type="button">重启</button>
+      <button id="btn-upgrade" type="button">升级</button>
+      <select id="source-select" title="启动源">
+        <option value="local">本地源码</option>
+        <option value="npx">npx</option>
+      </select>
+      <input id="local-path" type="text" spellcheck="false" placeholder="本地仓库路径" hidden />
+      <span class="spacer"></span>
+      <button id="btn-clear" type="button">清空</button>
+      <button id="btn-copy" type="button">复制</button>
+    </div>
+
+    <div class="workspace">
+      <pre class="log" id="log"></pre>
+      <section class="font-pane">
+        <h2>字体</h2>
+        <input type="search" id="font-search" placeholder="搜索字体…" autocomplete="off" />
+        <p id="font-status">正在读取系统字体…</p>
+        <div id="font-list" role="listbox" aria-label="系统字体"></div>
+        <div id="font-preview">DeepSeek Harness 字体预览 0123456789 The quick brown fox</div>
+        <div class="font-actions">
+          <button type="button" id="font-apply" class="primary">应用字体</button>
+        </div>
+      </section>
+    </div>
+  </body>
+</html>

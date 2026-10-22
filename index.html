@@ -7,51 +7,13 @@
     <script type="module" src="/src/main.ts"></script>
   </head>
   <body>
-    <header class="topbar open" id="topbar">
-      <div class="brand">
-        <span class="title">DSH Desktop</span>
-        <span class="version" id="version"></span>
+    <div class="app-frame" id="app-frame">
+      <div class="loading" id="loading">
+        <div class="spinner" id="loading-spinner"></div>
+        <p id="loading-text">正在启动 DeepSeek Harness …</p>
+        <p class="hint" id="loading-hint" hidden></p>
+        <button class="retry-btn" id="btn-retry" hidden>重试启动</button>
       </div>
-      <nav class="tabs">
-        <button class="tab active" data-tab="app">App</button>
-        <button class="tab" data-tab="cli">CLI</button>
-      </nav>
-      <div class="status">
-        <span class="dot" id="status-dot"></span>
-        <span id="status-text">启动中…</span>
-      </div>
-      <button type="button" class="bar-close" id="bar-close" title="隐藏工具栏">×</button>
-    </header>
-
-    <main>
-      <section class="panel active" id="panel-app">
-        <div class="app-frame" id="app-frame">
-          <div class="loading" id="loading">
-            <div class="spinner" id="loading-spinner"></div>
-            <p id="loading-text">正在启动 DeepSeek Harness …</p>
-            <p class="hint" id="loading-hint" hidden>可在上方 CLI 页签查看详细日志，安装好依赖后可重试。</p>
-            <button class="retry-btn" id="btn-retry" hidden>重试启动</button>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel" id="panel-cli">
-        <div class="cli-toolbar">
-          <button id="btn-start">启动</button>
-          <button id="btn-stop">停止</button>
-          <button id="btn-restart">重启</button>
-          <button id="btn-upgrade">升级</button>
-          <select id="source-select" title="启动源">
-            <option value="local">本地源码</option>
-            <option value="npx">npx</option>
-          </select>
-          <input id="local-path" type="text" spellcheck="false" placeholder="本地仓库路径" hidden />
-          <span class="spacer"></span>
-          <button id="btn-clear">清空</button>
-          <button id="btn-copy">复制</button>
-        </div>
-        <pre class="log" id="log"></pre>
-      </section>
-    </main>
+    </div>
   </body>
 </html>

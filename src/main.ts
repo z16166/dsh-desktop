@@ -1,19 +1,23 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { sameBox, syncGeometryOnFocus, type Box } from "./overlay-layout";
+import { kindForProcessLine } from "./log-kind";
 import {
-  chromeCloseHidesBar,
-  collapseChromeBeforeOverlay,
-  sameBox,
-  syncGeometryOnFocus,
-  type Box,
-} from "./overlay-layout";
+  type LogEntry,
+  type LogKind,
+  type StatusEvent,
+  type StatusState,
+} from "./shell-events";
 
 const PORT = 3080;
 const DEFAULT_APP_URL = "http://127.0.0.1:" + PORT;
+const LOG_LIMIT = 2000;
+const ERROR_HINT = "可在托盘菜单的「设置」中查看 CLI 日志，安装好依赖后可重试。";
+const STOPPED_HINT = "从托盘菜单打开「设置」可以查看日志、更换字体或重新启动。";
 let appUrl = DEFAULT_APP_URL;
 
 function publicAppUrl(u: string): string {
@@ -34,6 +38,12 @@ type AppSettings = {
   localPath: string;
 };
 
+type ServerStatus = {
+  running: boolean;
+  port: number;
+  url: string;
+};
+
 let settings: AppSettings = {
   source: "local",
   localPath: "H:\\github\\deepseek-harness",
@@ -45,21 +55,51 @@ function q<T extends HTMLElement>(sel: string): T {
 
 const DSH_LABEL = "dsh";
 const loading = q<HTMLDivElement>("#loading");
-const log = q<HTMLPreElement>("#log");
-const dot = q<HTMLSpanElement>("#status-dot");
-const statusText = q<HTMLSpanElement>("#status-text");
 const loadingSpinner = q<HTMLDivElement>("#loading-spinner");
 const loadingText = q<HTMLParagraphElement>("#loading-text");
-const topbar = q<HTMLElement>("#topbar");
 
-type State = "starting" | "running" | "stopped" | "error";
+type Phase = "starting" | "running" | "stopped";
 
-let upgrading = false;
-let cliMode = false;
+let phase: Phase = "starting";
 let ready = false;
+let stopRequested = false;
 let themeTimer: number | undefined;
 let withdrawn = false;
 let lastDshBox: Box | null = null;
+let logSeq = 0;
+const logHistory: LogEntry[] = [];
+
+function launchCommandLabel(): string {
+  return settings.source === "local"
+    ? "node --import tsx/esm apps/cli/src/bin.ts web --no-open  (" + settings.localPath + ")"
+    : "npx @deepseek-ai/dsh web --no-open";
+}
+
+function publishStatus(state: StatusState, text: string): void {
+  const payload: StatusEvent = { state, text };
+  void emit("shell:status", payload);
+}
+
+function appendLog(line: string, kind: LogKind): void {
+  const entry: LogEntry = { id: ++logSeq, kind, text: line };
+  logHistory.push(entry);
+  while (logHistory.length > LOG_LIMIT) logHistory.shift();
+  void emit("shell:log", entry);
+}
+
+function clearLogHistory(): void {
+  logHistory.length = 0;
+  void emit("shell:log-cleared");
+}
+
+async function serverStillRunning(): Promise<boolean> {
+  try {
+    const status = await invoke<ServerStatus>("server_status");
+    return status.running;
+  } catch {
+    return false;
+  }
+}
 
 async function mainAllowsOverlays(): Promise<boolean> {
   if (withdrawn) return false;
@@ -89,77 +129,36 @@ function stopThemeSync(): void {
   themeTimer = undefined;
 }
 
-function setStatus(state: State, text: string): void {
-  dot.className = "dot " + state;
-  statusText.textContent = text;
-}
-
-function appendLog(line: string, kind: "out" | "err" | "sys"): void {
-  const span = document.createElement("span");
-  span.className = kind;
-  span.textContent = line + "\n";
-  log.appendChild(span);
-  while (log.childElementCount > 2000) {
-    if (log.firstElementChild) log.removeChild(log.firstElementChild);
-  }
-  log.scrollTop = log.scrollHeight;
-}
-
-/** Switch the loading overlay between "starting", "error" and "stopped" states. */
 function setLoading(
   message: string,
-  opts: { error?: boolean; retry?: boolean; spinner?: boolean } = {},
+  opts: { error?: boolean; retry?: boolean; spinner?: boolean; hint?: string } = {},
 ): void {
+  loading.style.display = "";
   loadingSpinner.style.display = opts.error || opts.spinner === false ? "none" : "";
   loadingText.textContent = message;
   loadingText.classList.toggle("error-text", !!opts.error);
-  q<HTMLParagraphElement>("#loading-hint").hidden = !opts.error;
+  const hint = q<HTMLParagraphElement>("#loading-hint");
+  hint.hidden = !opts.hint;
+  hint.textContent = opts.hint ?? "";
   q<HTMLButtonElement>("#btn-retry").hidden = !opts.retry;
 }
 
 function showStartupError(message: string): void {
+  phase = "stopped";
   ready = false;
-  setStatus("error", "启动失败");
-  setLoading(message, { error: true, retry: true });
-  showChrome();
+  setLoading(message, { error: true, retry: true, hint: ERROR_HINT });
+  publishStatus("error", "启动失败");
   appendLog("> " + message, "err");
   void closeDshWindow();
 }
 
-function chromeOpen(): boolean {
-  return topbar.classList.contains("open");
-}
-
-function showChrome(): void {
-  if (!chromeOpen()) {
-    topbar.classList.add("open");
-  }
-  void syncDshBounds();
-}
-
-function collapseChromeBar(): void {
-  if (collapseChromeBeforeOverlay(cliMode) && chromeOpen()) {
-    topbar.classList.remove("open");
-  }
-}
-
-function syncChromeCloseButton(): void {
-  q<HTMLButtonElement>("#bar-close").hidden = !chromeCloseHidesBar(cliMode);
-}
-
-function hideChrome(): void {
-  if (!chromeCloseHidesBar(cliMode)) return;
-  if (chromeOpen()) {
-    topbar.classList.remove("open");
-  }
-  void syncDshBounds();
-}
-
-function setupChrome(): void {
-  syncChromeCloseButton();
-  q("#bar-close").addEventListener("click", () => {
-    hideChrome();
-  });
+function showStopped(label: string): void {
+  phase = "stopped";
+  ready = false;
+  const message = label === "已退出" ? "服务已退出" : "服务已停止";
+  setLoading(message, { spinner: false, retry: true, hint: STOPPED_HINT });
+  publishStatus("stopped", label);
+  void closeDshWindow();
 }
 
 async function dshWindow(): Promise<WebviewWindow | null> {
@@ -186,7 +185,7 @@ async function frameOverlayBox(): Promise<Box | null> {
 
 async function syncDshBounds(): Promise<void> {
   const wdw = await dshWindow();
-  if (!wdw || cliMode || !ready) return;
+  if (!wdw || !ready) return;
   if (!(await mainAllowsOverlays())) return;
   const box = await frameOverlayBox();
   if (!box) return;
@@ -201,7 +200,7 @@ async function onMainGeometryChanged(): Promise<void> {
     await hideDshWindow();
     return;
   }
-  if (ready && !cliMode) {
+  if (ready) {
     const wdw = await dshWindow();
     if (wdw) await showDshWindow();
   }
@@ -217,7 +216,7 @@ async function onMainFocusChanged(): Promise<void> {
     await hideDshWindow();
     return;
   }
-  if (ready && !cliMode) {
+  if (ready) {
     const wdw = await dshWindow();
     if (wdw) await showDshWindow();
   }
@@ -252,8 +251,7 @@ async function closeDshWindow(): Promise<void> {
 }
 
 async function showApp(): Promise<void> {
-  loading.style.display = "none";
-  if (cliMode || !(await mainAllowsOverlays())) {
+  if (!(await mainAllowsOverlays())) {
     await hideDshWindow();
     return;
   }
@@ -276,255 +274,130 @@ async function showApp(): Promise<void> {
   }
   await syncDshBounds();
   await showDshWindow();
+  loading.style.display = "none";
 }
 
-function launchCommandLabel(): string {
-  return settings.source === "local"
-    ? "node --import tsx/esm apps/cli/src/bin.ts web --no-open  (" + settings.localPath + ")"
-    : "npx @deepseek-ai/dsh web --no-open";
-}
-
-function syncSourceControls(): void {
-  const select = q<HTMLSelectElement>("#source-select");
-  const path = q<HTMLInputElement>("#local-path");
-  select.value = settings.source;
-  path.value = settings.localPath;
-  path.hidden = settings.source !== "local";
+async function reloadSettings(): Promise<void> {
+  try {
+    settings = await invoke<AppSettings>("get_settings");
+  } catch {
+    /* keep the last copy */
+  }
 }
 
 async function start(): Promise<void> {
+  await reloadSettings();
+  phase = "starting";
   ready = false;
-  setStatus("starting", "启动中…");
-  setLoading("正在启动 " + launchCommandLabel() + " …");
-  appendLog("$ " + launchCommandLabel(), "sys");
+  const label = launchCommandLabel();
+  setLoading("正在启动 " + label + " …");
+  publishStatus("starting", "启动中…");
+  appendLog("$ " + label, "sys");
   try {
-    const s = await invoke<any>("start_server");
-    appendLog("> 等待端口 " + s.port + " 就绪…", "sys");
+    const status = await invoke<ServerStatus>("start_server");
+    appendLog("> 等待端口 " + status.port + " 就绪…", "sys");
   } catch (e) {
     showStartupError("启动失败：" + String(e));
   }
 }
 
-async function stop(): Promise<void> {
-  appendLog("$ 停止服务…", "sys");
-  const s = await invoke<any>("stop_server");
-  if (s.running) {
-    appendLog("> 该服务非本应用启动，未停止", "sys");
-    setStatus("running", "运行中 · " + publicAppUrl(s.url || appUrl));
-  } else {
-    appUrl = DEFAULT_APP_URL;
-    setStatus("stopped", "已停止");
-    await closeDshWindow();
-  }
-}
-
-async function restart(): Promise<void> {
-  await stop();
-  await start();
-}
-
-async function upgrade(): Promise<void> {
-  if (upgrading) return;
-  upgrading = true;
-  const btn = q<HTMLButtonElement>("#btn-upgrade");
-  btn.disabled = true;
-  q<HTMLSelectElement>("#source-select").disabled = true;
-  q<HTMLInputElement>("#local-path").disabled = true;
-  appendLog(
-    settings.source === "local"
-      ? "> 正在从本地仓库升级（git pull → pnpm install → pnpm run build）…"
-      : "> 正在检查最新版本并安装…",
-    "sys",
-  );
-  try {
-    const r = await invoke<any>("upgrade_dsh");
-    if (r.ok) {
-      appendLog("> 已安装版本 " + r.version + " · " + r.message, "sys");
-      if (r.restarted) {
-        await closeDshWindow();
-        await showApp();
-      }
-    } else {
-      appendLog("> 升级失败：" + r.message, "err");
-    }
-  } catch (e2) {
-    appendLog("> 升级失败：" + String(e2), "err");
-  } finally {
-    upgrading = false;
-    btn.disabled = false;
-    q<HTMLSelectElement>("#source-select").disabled = false;
-    q<HTMLInputElement>("#local-path").disabled = false;
-  }
-}
-
-function clearLog(): void {
-  log.textContent = "";
-}
-
-async function copyLog(): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(log.textContent || "");
-    appendLog("> 已复制到剪贴板", "sys");
-  } catch {
-    appendLog("> 复制失败", "err");
-  }
-}
-
-function setupTabs(): void {
-  const tabs = document.querySelectorAll<HTMLButtonElement>(".tab");
-  const panels: Record<string, HTMLElement> = {
-    app: q("#panel-app"),
-    cli: q("#panel-cli"),
-  };
-  tabs.forEach((t) => {
-    t.addEventListener("click", () => {
-      tabs.forEach((x) => x.classList.remove("active"));
-      t.classList.add("active");
-      const key = t.dataset.tab || "app";
-      Object.keys(panels).forEach((k) => panels[k].classList.toggle("active", k === key));
-      if (key === "cli") {
-        cliMode = true;
-        syncChromeCloseButton();
-        showChrome();
-        void hideDshWindow();
-      } else {
-        cliMode = false;
-        syncChromeCloseButton();
-        if (ready) void showApp();
-      }
-    });
-  });
-}
-
 async function setupEvents(): Promise<void> {
-  await listen<string>("server:stdout", (e) => appendLog(e.payload, "out"));
-  await listen<string>("server:stderr", (e) => appendLog(e.payload, "err"));
+  await listen<{ kind: LogKind; text: string }>("shell:note", (e) => {
+    appendLog(e.payload.text, e.payload.kind);
+  });
+  await listen("shell:clear", () => {
+    clearLogHistory();
+  });
+  await listen("settings:hello", () => {
+    void emit("shell:log-history", logHistory.slice());
+  });
+  await listen<{ message?: string }>("shell:starting", (e) => {
+    // A late copy of this event must not pull the harness back down after it is already up.
+    if (ready && phase === "running") return;
+    phase = "starting";
+    ready = false;
+    const message = e.payload?.message || "正在启动 " + launchCommandLabel() + " …";
+    setLoading(message);
+    publishStatus("starting", "启动中…");
+  });
+  await listen("shell:stopping", () => {
+    stopRequested = true;
+  });
+  await listen<{ message: string }>("shell:start-failed", (e) => {
+    showStartupError(e.payload.message);
+  });
+
+  await listen<string>("server:stdout", (e) => {
+    appendLog(e.payload, kindForProcessLine("out", e.payload));
+  });
+  await listen<string>("server:stderr", (e) => {
+    appendLog(e.payload, kindForProcessLine("err", e.payload));
+  });
   await listen<string>("server:ready", (e) => {
     const next = (e.payload && String(e.payload).trim()) || DEFAULT_APP_URL;
-    ready = true;
     const urlChanged = next !== appUrl;
     appUrl = next;
-    setStatus("running", "运行中 · " + publicAppUrl(appUrl));
+    phase = "running";
+    ready = true;
+    publishStatus("running", "运行中 · " + publicAppUrl(appUrl));
     void (async () => {
       if (urlChanged) await closeDshWindow();
-      if (collapseChromeBeforeOverlay(cliMode)) collapseChromeBar();
       await showApp();
     })();
     appendLog("> 就绪：" + publicAppUrl(appUrl), "sys");
-    refreshDshVersion();
   });
   await listen("server:timeout", () => {
     showStartupError("启动超时：90 秒内未检测到 Web UI 就绪，请检查 CLI 日志");
   });
-  await listen<number | null>("server:exited", (e) => {
-    if (ready) {
-      setStatus("stopped", "已退出");
-      appendLog("> 进程已退出 (code=" + e.payload + ")", "sys");
-      void closeDshWindow();
-    } else {
-      showStartupError("启动失败：进程提前退出（退出码 " + e.payload + "），请检查 CLI 日志");
+  await listen("shell:stop-cancelled", () => {
+    stopRequested = false;
+  });
+  await listen<number | null>("server:exited", async (e) => {
+    appendLog("> 进程已退出 (code=" + e.payload + ")", "sys");
+    if (await serverStillRunning()) {
+      stopRequested = false;
+      return;
     }
+    if (stopRequested) {
+      stopRequested = false;
+      showStopped("已退出");
+      return;
+    }
+    if (phase === "starting") {
+      showStartupError("启动失败：进程提前退出（退出码 " + e.payload + "），请检查 CLI 日志");
+      return;
+    }
+    showStopped("已退出");
   });
-  await listen("server:stopped", () => {
-    if (!ready) setLoading("服务已停止", { spinner: false });
-    setStatus("stopped", "已停止");
+  await listen("server:stopped", async () => {
+    if (await serverStillRunning()) {
+      stopRequested = false;
+      return;
+    }
+    stopRequested = false;
+    showStopped("已停止");
   });
-  await listen<string>("upgrade:stdout", (e2) => appendLog(e2.payload, "out"));
-  await listen<string>("upgrade:stderr", (e2) => appendLog(e2.payload, "err"));
+  await listen<string>("upgrade:stdout", (e2) => {
+    appendLog(e2.payload, kindForProcessLine("out", e2.payload));
+  });
+  await listen<string>("upgrade:stderr", (e2) => {
+    appendLog(e2.payload, kindForProcessLine("err", e2.payload));
+  });
   await listen("app:withdraw", () => {
     withdrawn = true;
     void hideDshWindow();
   });
   await listen("app:restore", () => {
     withdrawn = false;
-    if (ready && !cliMode) void showApp();
+    if (ready) void showApp();
   });
-  await listen("chrome:show", () => {
-    showChrome();
-  });
-}
-
-async function persistSettings(next: AppSettings, restartAfter: boolean): Promise<boolean> {
-  try {
-    settings = await invoke<AppSettings>("set_settings", { settings: next });
-    syncSourceControls();
-    appendLog(
-      "> 启动源已设为 " +
-        (settings.source === "local" ? "本地源码 · " + settings.localPath : "npx"),
-      "sys",
-    );
-    if (restartAfter) await restart();
-    return true;
-  } catch (e) {
-    appendLog("> 保存启动源失败：" + String(e), "err");
-    syncSourceControls();
-    return false;
-  }
-}
-
-function setupSourceControls(): void {
-  const select = q<HTMLSelectElement>("#source-select");
-  const path = q<HTMLInputElement>("#local-path");
-  select.addEventListener("change", async () => {
-    if (upgrading) {
-      syncSourceControls();
-      return;
-    }
-    const next: AppSettings = {
-      source: select.value === "local" ? "local" : "npx",
-      localPath: path.value.trim() || settings.localPath,
-    };
-    await persistSettings(next, true);
-  });
-  const applyPath = async () => {
-    if (upgrading || settings.source !== "local") return;
-    const localPath = path.value.trim();
-    if (!localPath || localPath === settings.localPath) return;
-    await persistSettings({ source: "local", localPath }, true);
-  };
-  path.addEventListener("change", applyPath);
-  path.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      void applyPath();
-    }
-  });
-}
-
-function setupButtons(): void {
-  q("#btn-start").addEventListener("click", start);
-  q("#btn-stop").addEventListener("click", stop);
-  q("#btn-restart").addEventListener("click", restart);
-  q("#btn-upgrade").addEventListener("click", upgrade);
-  q("#btn-clear").addEventListener("click", clearLog);
-  q("#btn-copy").addEventListener("click", copyLog);
-  q("#btn-retry").addEventListener("click", start);
-}
-
-/** Show the DeepSeek Harness (dsh) version in the topbar, not the app's own. */
-async function refreshDshVersion(): Promise<void> {
-  const el = q<HTMLSpanElement>("#version");
-  try {
-    const v = await invoke<string>("dsh_version");
-    const suffix = settings.source === "local" ? " · 本地" : "";
-    el.textContent = v && v !== "unknown" ? "dsh v" + v + suffix : "dsh 未知";
-  } catch {
-    el.textContent = "dsh 未知";
-  }
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  setupTabs();
-  setupButtons();
-  setupSourceControls();
-  setupChrome();
-  try {
-    settings = await invoke<AppSettings>("get_settings");
-  } catch {
-    /* keep defaults */
-  }
-  syncSourceControls();
-  q("#version").textContent = "dsh …";
+  q("#btn-retry").addEventListener("click", () => {
+    void start();
+  });
+  await reloadSettings();
   const main = getCurrentWindow();
   await main.onResized(() => {
     void onMainGeometryChanged();
@@ -537,9 +410,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   await setupEvents();
   try {
-    const s = await invoke<any>("server_status");
-    if (s.running) {
-      appendLog("> 检测到 " + s.url + " 已有端口，等待 Web UI 就绪…", "sys");
+    const status = await invoke<ServerStatus>("server_status");
+    if (status.running) {
+      appendLog("> 检测到 " + status.url + " 已有端口，等待 Web UI 就绪…", "sys");
     }
   } catch {
     /* start() will report its own errors */

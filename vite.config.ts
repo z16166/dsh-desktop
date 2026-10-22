@@ -19,7 +19,7 @@ export default defineConfig({
       input: {
         main: resolve(root, "index.html"),
         quit: resolve(root, "quit.html"),
-        font: resolve(root, "font.html"),
+        settings: resolve(root, "settings.html"),
       },
     },
   },

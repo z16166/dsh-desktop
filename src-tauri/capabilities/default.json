@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main", "dsh", "font-picker"],
+  "windows": ["main", "dsh", "settings"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",

@@ -1,5 +1,4 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-#![cfg_attr(windows, feature(windows_process_extensions_show_window))]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -186,24 +185,21 @@ fn open_in_default_browser(url: &str) {
     }
 }
 
-/// Tray commands. The toolbar entry is the escape hatch for a floating button
-/// that failed to surface: without it the CLI log tab is unreachable.
+/// Tray commands. The main window is only the harness page, so the CLI log,
+/// launch controls, and font picker live in the settings window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrayAction {
-    ShowChrome,
-    PickFont,
+    OpenSettings,
     Quit,
     None,
 }
 
-const TRAY_SHOW_CHROME_ID: &str = "show-chrome";
-const TRAY_FONT_ID: &str = "pick-font";
+const TRAY_SETTINGS_ID: &str = "open-settings";
 const TRAY_QUIT_ID: &str = "quit";
 
 fn tray_menu_action(id: &str) -> TrayAction {
     match id {
-        TRAY_SHOW_CHROME_ID => TrayAction::ShowChrome,
-        TRAY_FONT_ID => TrayAction::PickFont,
+        TRAY_SETTINGS_ID => TrayAction::OpenSettings,
         TRAY_QUIT_ID => TrayAction::Quit,
         _ => TrayAction::None,
     }
@@ -1158,8 +1154,9 @@ fn set_settings(app: AppHandle, mut settings: AppSettings) -> Result<AppSettings
     if settings.source == LaunchSource::Local {
         validate_local_repo(&settings.local_path)?;
     }
-    // Zoom and font are set from the page and the tray, not from the settings
-    // UI, whose payload carries neither and would reset both to their defaults.
+    // Zoom is learned from the page. The font is written by `set_dsh_font`
+    // from the settings window. This payload carries neither, so a launch-source
+    // change must not reset them to the serde defaults.
     let stored = load_settings(&app);
     settings.zoom = stored.zoom;
     settings.font = stored.font;
@@ -1167,7 +1164,7 @@ fn set_settings(app: AppHandle, mut settings: AppSettings) -> Result<AppSettings
     Ok(settings)
 }
 
-/// Family names installed on this machine, for the picker window.
+/// Family names installed on this machine, for the settings window.
 ///
 /// `async` so the enumeration lands on Tauri's thread pool: it walks the
 /// registry-backed font tables, which on a cold cache or a machine with a large
@@ -1707,6 +1704,7 @@ mod win32 {
         pub fn GetExitCodeProcess(handle: isize, exit_code: *mut u32) -> i32;
         pub fn AttachConsole(process_id: u32) -> i32;
         pub fn FreeConsole() -> i32;
+        #[cfg(test)]
         pub fn GetStdHandle(n_std_handle: u32) -> isize;
         pub fn SetStdHandle(n_std_handle: u32, h_handle: isize) -> i32;
         pub fn SetConsoleCtrlHandler(
@@ -2029,10 +2027,10 @@ fn hide_owned_overlays(app: &AppHandle) {
     }
 }
 
-/// Hide the frameless overlay on the page's behalf (CLI tab, geometry changes).
+/// Hide the frameless overlay when the shell is minimized or withdrawn.
 ///
 /// The page's own `WebviewWindow::hide()` hits the same stale-cache no-op the close path
-/// does, which would leave the harness page painted over the CLI log; route it through
+/// does, which would leave the harness page painted on top; route it through
 /// the hide that verifies against the OS instead.
 #[tauri::command]
 fn hide_dsh_window(app: AppHandle) {
@@ -2165,7 +2163,7 @@ fn hide_to_tray(app: &AppHandle) {
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
 const QUIT_WINDOW_LABEL: &str = "quitting";
-const FONT_WINDOW_LABEL: &str = "font-picker";
+const SETTINGS_WINDOW_LABEL: &str = "settings";
 
 /// True only for the click that owns the shutdown; later ones lose the race.
 fn claim_quit(flag: &AtomicBool) -> bool {
@@ -2245,21 +2243,17 @@ fn restore_from_tray(app: &AppHandle) {
     let _ = app.emit("app:restore", ());
 }
 
-fn show_chrome_from_tray(app: &AppHandle) {
+/// A separate window: the harness overlay covers the main webview, so a panel
+/// drawn in that page would sit underneath the page it is meant to configure.
+///
+/// It stays a normal taskbar window. The harness overlay is owned by the shell
+/// and comes forward with it, so a tool window with no taskbar button can only
+/// be reached again from the tray.
+fn show_settings(app: &AppHandle) {
     if quitting() {
         return;
     }
-    restore_from_tray(app);
-    let _ = app.emit("chrome:show", ());
-}
-
-/// A real window rather than an in-page panel: the picker previews families by
-/// rendering in them, and the Harness page is not ours to draw a list into.
-fn show_font_picker(app: &AppHandle) {
-    if quitting() {
-        return;
-    }
-    if let Some(wdw) = app.get_webview_window(FONT_WINDOW_LABEL) {
+    if let Some(wdw) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
         let _ = wdw.unminimize();
         let _ = wdw.show();
         let _ = wdw.set_focus();
@@ -2267,14 +2261,13 @@ fn show_font_picker(app: &AppHandle) {
     }
     let built = tauri::WebviewWindowBuilder::new(
         app,
-        FONT_WINDOW_LABEL,
-        tauri::WebviewUrl::App("font.html".into()),
+        SETTINGS_WINDOW_LABEL,
+        tauri::WebviewUrl::App("settings.html".into()),
     )
-    .title("选择字体")
-    .inner_size(520.0, 620.0)
-    .min_inner_size(420.0, 420.0)
+    .title("设置")
+    .inner_size(980.0, 720.0)
+    .min_inner_size(760.0, 560.0)
     .center()
-    .always_on_top(true)
     .focused(true)
     .build();
     match built {
@@ -2282,21 +2275,14 @@ fn show_font_picker(app: &AppHandle) {
             let _ = wdw.show();
             let _ = wdw.set_focus();
         }
-        Err(e) => eprintln!("dsh-desktop: could not open the font picker: {e}"),
+        Err(e) => eprintln!("dsh-desktop: could not open settings: {e}"),
     }
 }
 
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let show_chrome = MenuItem::with_id(
-        app,
-        TRAY_SHOW_CHROME_ID,
-        "显示工具栏（CLI 日志）",
-        true,
-        None::<&str>,
-    )?;
-    let pick_font = MenuItem::with_id(app, TRAY_FONT_ID, "选择字体…", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, TRAY_SETTINGS_ID, "设置", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, TRAY_QUIT_ID, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_chrome, &pick_font, &quit])?;
+    let menu = Menu::with_items(app, &[&settings_item, &quit])?;
     let icon = app
         .default_window_icon()
         .cloned()
@@ -2307,8 +2293,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match tray_menu_action(event.id.as_ref()) {
-            TrayAction::ShowChrome => show_chrome_from_tray(app),
-            TrayAction::PickFont => show_font_picker(app),
+            TrayAction::OpenSettings => show_settings(app),
             TrayAction::Quit => begin_quit(app),
             TrayAction::None => {}
         })
@@ -2753,8 +2738,8 @@ mod tests {
         );
         assert!(
             production.contains("fn hide_dsh_window("),
-            "the page hides the overlay for the CLI tab too; that hide needs the same \
-             verification, so it goes through a command instead of WebviewWindow::hide()"
+            "the page hides the overlay when the shell is minimized or withdrawn; that hide \
+             needs the same verification, so it goes through a command instead of WebviewWindow::hide()"
         );
         assert!(
             production.contains("let _ = win32::ShowWindow(hwnd.0 as isize, SW_SHOWNOACTIVATE)"),
@@ -2781,19 +2766,47 @@ mod tests {
     }
 
     #[test]
-    fn tray_offers_a_toolbar_escape_hatch_next_to_quit() {
-        assert_eq!(tray_menu_action(TRAY_SHOW_CHROME_ID), TrayAction::ShowChrome);
-        assert_eq!(tray_menu_action(TRAY_FONT_ID), TrayAction::PickFont);
+    fn tray_opens_settings_or_quits() {
+        assert_eq!(tray_menu_action(TRAY_SETTINGS_ID), TrayAction::OpenSettings);
         assert_eq!(tray_menu_action(TRAY_QUIT_ID), TrayAction::Quit);
+        assert_eq!(tray_menu_action("show-chrome"), TrayAction::None);
+        assert_eq!(tray_menu_action("pick-font"), TrayAction::None);
         assert_eq!(tray_menu_action("whatever"), TrayAction::None);
     }
 
     #[test]
-    fn font_picker_is_neither_overlay_nor_persisted() {
-        assert!(!persist_window_state_for(FONT_WINDOW_LABEL));
+    fn tray_menu_is_settings_instead_of_the_toolbar_and_font_picker() {
+        let production = include_str!("main.rs").split("mod tests {").next().unwrap();
+        assert!(production.contains("\"设置\""));
+        assert!(production.contains("settings.html"));
+        assert!(!production.contains("显示工具栏"));
+        assert!(!production.contains("选择字体"));
+        assert!(!production.contains("font.html"));
+        assert!(!production.contains("chrome:show"));
+    }
+
+    #[test]
+    fn settings_window_is_neither_overlay_nor_persisted() {
+        assert!(!persist_window_state_for(SETTINGS_WINDOW_LABEL));
         assert!(
-            !OWNED_OVERLAY_LABELS.contains(&FONT_WINDOW_LABEL),
-            "withdrawing the shell must not hide the font picker"
+            !OWNED_OVERLAY_LABELS.contains(&SETTINGS_WINDOW_LABEL),
+            "withdrawing the shell must not hide the settings window"
+        );
+    }
+
+    #[test]
+    fn settings_window_keeps_a_taskbar_button() {
+        let production = include_str!("main.rs").split("mod tests {").next().unwrap();
+        let body = production
+            .split("fn show_settings(")
+            .nth(1)
+            .unwrap()
+            .split("fn setup_tray(")
+            .next()
+            .unwrap();
+        assert!(
+            !body.contains("skip_taskbar"),
+            "without a taskbar button the harness overlay covers settings and Alt+Tab cannot reach it"
         );
     }
 
