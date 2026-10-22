@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { filterFontFamilies } from "./font-filter";
 import { currentFontStatus } from "./font-status";
+import { settingsFontFamily } from "./settings-appearance";
 
 const AUTO_LABEL = "（自动：霞鹜文楷）";
 const PREVIEW_SAMPLE = "DeepSeek Harness 字体预览 0123456789 The quick brown fox";
@@ -22,6 +23,10 @@ export function mountFontPicker(opts: { onApplied?: (name: string) => void } = {
   function previewFamily(name: string): void {
     preview.style.fontFamily = name ? JSON.stringify(name) : "";
     preview.textContent = name ? PREVIEW_SAMPLE : `${AUTO_LABEL}\n${PREVIEW_SAMPLE}`;
+  }
+
+  function useSelectedFont(name: string): void {
+    document.documentElement.style.fontFamily = settingsFontFamily(name);
   }
 
   function paint(scrollSelected: boolean): void {
@@ -87,6 +92,7 @@ export function mountFontPicker(opts: { onApplied?: (name: string) => void } = {
 
   function showCurrent(): void {
     status.textContent = currentFontStatus(selected);
+    useSelectedFont(selected);
     previewFamily(selected);
   }
 
@@ -119,6 +125,7 @@ export function mountFontPicker(opts: { onApplied?: (name: string) => void } = {
       applyBtn.disabled = true;
       try {
         await invoke("set_dsh_font", { name: selected });
+        useSelectedFont(selected);
         status.textContent = selected ? `已应用 ${selected}` : "已应用自动字体";
         opts.onApplied?.(selected);
       } catch (e) {
@@ -132,6 +139,7 @@ export function mountFontPicker(opts: { onApplied?: (name: string) => void } = {
   void (async () => {
     try {
       selected = await invoke<string>("get_dsh_font");
+      useSelectedFont(selected);
     } catch (e) {
       if (!listed && !listing) {
         status.textContent = "无法读取当前字体：" + String(e);

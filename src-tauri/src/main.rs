@@ -440,6 +440,74 @@ fn remember_wanted_font(font: &str) {
     *WANTED_FONT.lock().unwrap() = Some(font.to_string());
 }
 
+/// Harness publishes `light`, `dark`, or `system` on the document element.
+/// Anything else falls back to the resolved palette on `body`.
+fn settings_theme_source(source: &str, dark: bool) -> String {
+    match source {
+        "light" | "dark" | "system" => source.to_string(),
+        _ if dark => "dark".to_string(),
+        _ => "light".to_string(),
+    }
+}
+
+/// Light or dark for the settings window's first paint. `system` uses the
+/// palette the harness page has already applied, not this machine's scheme.
+fn settings_palette(source: &str, dark: bool) -> &'static str {
+    match source {
+        "dark" => "dark",
+        "light" => "light",
+        _ if dark => "dark",
+        _ => "light",
+    }
+}
+
+static SETTINGS_PALETTE: Mutex<Option<&'static str>> = Mutex::new(None);
+
+/// An empty or unknown source means the harness document has not installed
+/// its palette yet. Remembering that would freeze the settings window on the
+/// wrong color until the next real reading.
+fn known_theme_source(source: &str) -> bool {
+    matches!(source, "light" | "dark" | "system")
+}
+
+fn remember_settings_palette(source: &str, dark: bool) {
+    if !known_theme_source(source) {
+        return;
+    }
+    *SETTINGS_PALETTE.lock().unwrap() = Some(settings_palette(source, dark));
+}
+
+fn current_settings_palette() -> &'static str {
+    if let Some(palette) = *SETTINGS_PALETTE.lock().unwrap() {
+        return palette;
+    }
+    if system_apps_use_dark_theme() {
+        "dark"
+    } else {
+        "light"
+    }
+}
+
+fn settings_theme_init_script(palette: &str) -> String {
+    format!("window.__DSH_SETTINGS_THEME__={palette:?};")
+}
+
+fn settings_surface(palette: &str) -> tauri::window::Color {
+    if palette == "dark" {
+        tauri::window::Color(0x0e, 0x11, 0x16, 255)
+    } else {
+        tauri::window::Color(0xf3, 0xf5, 0xf8, 255)
+    }
+}
+
+fn settings_window_theme(palette: &str) -> tauri::Theme {
+    if palette == "dark" {
+        tauri::Theme::Dark
+    } else {
+        tauri::Theme::Light
+    }
+}
+
 /// Whether the page is missing the font it should have.
 ///
 /// An empty `applied` means nothing has been injected yet. Once the script has
@@ -1395,6 +1463,12 @@ struct DshTheme {
     /// nothing, empty when the script has never run.
     #[serde(default)]
     font: String,
+    /// `html[data-ds-theme-source]`: `light`, `dark`, or `system`.
+    #[serde(default)]
+    source: String,
+    /// Resolved palette from `body[data-ds-dark-theme]`.
+    #[serde(default)]
+    dark: bool,
 }
 
 const READ_DSH_THEME_JS: &str = r#"
@@ -1410,7 +1484,9 @@ const READ_DSH_THEME_JS: &str = r#"
       || cs.backgroundColor;
     const styled = document.documentElement.classList.contains("dsh-desktop-wide-chat");
     const font = document.documentElement.dataset.dshDesktopFont || "";
-    return { bg, dpr: window.devicePixelRatio, styled, font };
+    const source = document.documentElement.getAttribute("data-ds-theme-source") || "";
+    const dark = !!(body && body.hasAttribute("data-ds-dark-theme"));
+    return { bg, dpr: window.devicePixelRatio, styled, font, source, dark };
   } catch (e) {
     return null;
   }
@@ -1435,6 +1511,14 @@ fn sync_dsh_theme(app: AppHandle) {
         let Ok(theme) = serde_json::from_value::<DshTheme>(value) else {
             return;
         };
+        remember_settings_palette(&theme.source, theme.dark);
+        let _ = app.emit(
+            "shell:theme",
+            serde_json::json!({
+                "source": settings_theme_source(&theme.source, theme.dark),
+                "dark": theme.dark,
+            }),
+        );
         if theme.bg.is_empty() {
             return;
         }
@@ -1590,6 +1674,15 @@ async fn create_dsh_window(
         .focused(false)
         .visible(false)
         .zoom_hotkeys_enabled(true)
+        .on_page_load(|webview, payload| {
+            // The body boot script has already written the palette by the time
+            // the document finishes. Read it now, before the 1.5s poll, so a
+            // settings window opened immediately afterwards already has it.
+            if payload.event() != tauri::webview::PageLoadEvent::Finished {
+                return;
+            }
+            sync_dsh_theme(webview.app_handle().clone());
+        })
         .on_new_window(|url, _features| {
             open_in_default_browser(url.as_str());
             tauri::webview::NewWindowResponse::Deny
@@ -2325,6 +2418,50 @@ fn restore_from_tray(app: &AppHandle) {
     let _ = app.emit("app:restore", ());
 }
 
+/// AppsUseLightTheme is 0 when Windows apps are in dark mode. A missing key
+/// means the classic light default, which matches the page's own fallback.
+#[cfg(windows)]
+fn system_apps_use_dark_theme() -> bool {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            ty: *mut u32,
+            data: *mut std::ffi::c_void,
+            len: *mut u32,
+        ) -> i32;
+    }
+    const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+    let sub_key: Vec<u16> =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+            .encode_utf16()
+            .collect();
+    let value: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+    let mut data: u32 = 1;
+    let mut len: u32 = 4;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub_key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut data as *mut u32 as *mut std::ffi::c_void,
+            &mut len,
+        )
+    };
+    rc == 0 && data == 0
+}
+
+#[cfg(not(windows))]
+fn system_apps_use_dark_theme() -> bool {
+    false
+}
+
 /// A separate window: the harness overlay covers the main webview, so a panel
 /// drawn in that page would sit underneath the page it is meant to configure.
 ///
@@ -2341,6 +2478,7 @@ fn show_settings(app: &AppHandle) {
         let _ = wdw.set_focus();
         return;
     }
+    let palette = current_settings_palette();
     let built = tauri::WebviewWindowBuilder::new(
         app,
         SETTINGS_WINDOW_LABEL,
@@ -2350,6 +2488,9 @@ fn show_settings(app: &AppHandle) {
     .inner_size(980.0, 720.0)
     .min_inner_size(760.0, 560.0)
     .center()
+    .theme(Some(settings_window_theme(palette)))
+    .background_color(settings_surface(palette))
+    .initialization_script(settings_theme_init_script(palette))
     .focused(true)
     .build();
     match built {
@@ -2691,6 +2832,52 @@ mod tests {
         assert!(!READ_DSH_THEME_JS.contains("Session log"));
         assert!(!READ_DSH_THEME_JS.contains("Session 日志"));
         assert!(!READ_DSH_THEME_JS.contains("avoid"));
+        assert!(
+            READ_DSH_THEME_JS.contains("data-ds-theme-source"),
+            "the settings window mirrors the harness appearance preference"
+        );
+    }
+
+    #[test]
+    fn settings_theme_follows_the_harness_preference() {
+        assert_eq!(settings_theme_source("dark", false), "dark");
+        assert_eq!(settings_theme_source("light", true), "light");
+        assert_eq!(settings_theme_source("system", true), "system");
+        assert_eq!(settings_theme_source("", true), "dark");
+        assert_eq!(settings_theme_source("custom", false), "light");
+        assert_eq!(settings_palette("dark", false), "dark");
+        assert_eq!(settings_palette("light", true), "light");
+        assert_eq!(settings_palette("system", true), "dark");
+        assert_eq!(settings_palette("system", false), "light");
+        assert_eq!(settings_palette("", true), "dark");
+        assert!(known_theme_source("dark"));
+        assert!(known_theme_source("light"));
+        assert!(known_theme_source("system"));
+        assert!(!known_theme_source(""));
+        assert!(!known_theme_source("custom"));
+        assert_eq!(
+            settings_theme_init_script("dark"),
+            "window.__DSH_SETTINGS_THEME__=\"dark\";"
+        );
+    }
+
+    #[test]
+    fn settings_window_paints_the_harness_palette_before_the_document() {
+        let production = include_str!("main.rs").split("mod tests {").next().unwrap();
+        let body = production
+            .split("fn show_settings(")
+            .nth(1)
+            .unwrap()
+            .split("fn setup_tray(")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("background_color(settings_surface(palette))"),
+            "the webview's first frame has to already be the harness color"
+        );
+        assert!(body.contains("initialization_script(settings_theme_init_script(palette))"));
+        assert!(body.contains(".theme(Some(settings_window_theme(palette)))"));
+        assert!(production.contains("window.__DSH_SETTINGS_THEME__"));
     }
 
     #[test]
@@ -2966,6 +3153,18 @@ mod tests {
             production.contains("async fn create_dsh_window("),
             "a blocking IPC command creates the overlay inside the caller webview's callback; WebView2 never finishes initializing"
         );
+        let body = production
+            .split("async fn create_dsh_window(")
+            .nth(1)
+            .unwrap()
+            .split("fn apply_saved_zoom(")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("PageLoadEvent::Finished"),
+            "the palette has to be read when the harness document finishes, not on a later poll"
+        );
+        assert!(body.contains("sync_dsh_theme(webview.app_handle().clone())"));
     }
 
     #[test]

@@ -16,6 +16,15 @@ test("settings markup keeps the font catalog hidden until the user asks", () => 
   assert.doesNotMatch(html, /正在读取系统字体/);
 });
 
+test("choosing a font does not restyle the dialog until it is applied", () => {
+  const src = readFileSync(new URL("./font.ts", import.meta.url), "utf8");
+  const pick = src.split("function pick(")[1]?.split("function showCurrent(")[0] ?? "";
+  assert.match(pick, /previewFamily/);
+  assert.doesNotMatch(pick, /useSelectedFont/);
+  const apply = src.split('invoke("set_dsh_font"')[1]?.split("} catch")[0] ?? "";
+  assert.match(apply, /useSelectedFont\(selected\)/);
+});
+
 test("opening the font pane does not ask for the system font catalog", () => {
   const src = readFileSync(new URL("./font.ts", import.meta.url), "utf8");
   const beforeLoad = src.split("async function loadFontList(")[0];

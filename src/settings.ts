@@ -1,8 +1,8 @@
-import "./settings.css";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { mountFontPicker } from "./font";
 import { type LogEntry, type LogKind, type StatusEvent, type StatusState } from "./shell-events";
+import { bootTheme, resolvedTheme, themeSourceFromProbe, type ThemeSource } from "./settings-appearance";
 
 const DEFAULT_APP_URL = "http://127.0.0.1:3080";
 
@@ -248,6 +248,39 @@ async function copyLog(): Promise<void> {
   }
 }
 
+let themeSource: ThemeSource = "system";
+const systemTheme = window.matchMedia("(prefers-color-scheme: dark)");
+
+function paintTheme(): void {
+  document.documentElement.dataset.theme = resolvedTheme(themeSource, systemTheme.matches);
+}
+
+function startThemeMirror(): void {
+  const preset = (window as Window & { __DSH_SETTINGS_THEME__?: unknown }).__DSH_SETTINGS_THEME__;
+  // The head script already painted this. Resolving the default "system"
+  // preference here would replace a dark harness with a light OS scheme
+  // until the first probe came back.
+  let holdPalette = preset === "light" || preset === "dark";
+  if (holdPalette) {
+    document.documentElement.dataset.theme = bootTheme(preset, systemTheme.matches);
+  }
+  systemTheme.addEventListener("change", () => {
+    if (!holdPalette) paintTheme();
+  });
+  void listen<{ source?: string; dark?: boolean }>("shell:theme", (e) => {
+    themeSource = themeSourceFromProbe(e.payload.source ?? "", !!e.payload.dark);
+    holdPalette = false;
+    paintTheme();
+  }).catch(() => {
+    /* outside the shell there is no event bus */
+  });
+  const pull = () => {
+    void invoke("sync_dsh_theme").catch(() => {});
+  };
+  pull();
+  window.setInterval(pull, 1500);
+}
+
 async function setupLog(): Promise<void> {
   await listen<LogEntry>("shell:log", (e) => {
     if (!historyApplied) {
@@ -307,6 +340,7 @@ async function loadSnapshot(): Promise<void> {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  startThemeMirror();
   setupSourceControls();
   q("#btn-start").addEventListener("click", () => void start());
   q("#btn-stop").addEventListener("click", () => void stop());

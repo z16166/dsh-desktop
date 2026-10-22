@@ -3,12 +3,31 @@
   <head>
     <meta charset="UTF-8" />
     <title>设置</title>
+    <script>
+      (function () {
+        var preset = window.__DSH_SETTINGS_THEME__;
+        var theme = preset === "light" || preset === "dark"
+          ? preset
+          : (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
+    <style>
+      html, body { background: #0e1116; color: #e7ecf3; color-scheme: dark; }
+      html[data-theme="light"], html[data-theme="light"] body {
+        background: #f3f5f8; color: #1b2430; color-scheme: light;
+      }
+    </style>
+    <link rel="stylesheet" href="/src/settings.css" />
     <script type="module" src="/src/settings.ts"></script>
   </head>
   <body>
     <header class="head">
       <div class="brand">
-        <span class="title">设置</span>
+        <div class="title-block">
+          <span class="title">设置</span>
+          <span class="subtitle">DeepSeek Harness</span>
+        </div>
         <span class="version" id="version">dsh …</span>
       </div>
       <div class="status">
@@ -17,34 +36,56 @@
       </div>
     </header>
 
-    <div class="toolbar">
-      <button id="btn-start" type="button">启动</button>
-      <button id="btn-stop" type="button">停止</button>
-      <button id="btn-restart" type="button">重启</button>
-      <button id="btn-upgrade" type="button">升级</button>
-      <select id="source-select" title="启动源">
-        <option value="local">本地源码</option>
-        <option value="npx">npx</option>
-      </select>
-      <input id="local-path" type="text" spellcheck="false" placeholder="本地仓库路径" hidden />
-      <span class="spacer"></span>
-      <button id="btn-clear" type="button">清空</button>
-      <button id="btn-copy" type="button">复制</button>
+    <div class="controls">
+      <div class="cluster">
+        <span class="cluster-label">服务</span>
+        <div class="cluster-body">
+          <button id="btn-start" type="button">启动</button>
+          <button id="btn-stop" type="button">停止</button>
+          <button id="btn-restart" type="button">重启</button>
+          <button id="btn-upgrade" type="button">升级</button>
+        </div>
+      </div>
+      <div class="cluster cluster-source">
+        <span class="cluster-label">启动源</span>
+        <div class="cluster-body">
+          <select id="source-select" title="启动源">
+            <option value="local">本地源码</option>
+            <option value="npx">npx</option>
+          </select>
+          <input id="local-path" type="text" spellcheck="false" placeholder="本地仓库路径" hidden />
+        </div>
+      </div>
+      <div class="cluster cluster-end">
+        <span class="cluster-label">日志</span>
+        <div class="cluster-body">
+          <button id="btn-clear" type="button">清空</button>
+          <button id="btn-copy" type="button">复制</button>
+        </div>
+      </div>
     </div>
 
     <div class="workspace">
-      <pre class="log" id="log"></pre>
-      <section class="font-pane">
-        <h2>字体</h2>
+      <section class="log-pane">
+        <div class="pane-head">
+          <h2>运行日志</h2>
+        </div>
+        <pre class="log" id="log"></pre>
+      </section>
+      <aside class="font-pane">
+        <div class="pane-head">
+          <h2>界面字体</h2>
+        </div>
         <p id="font-status">当前字体：…</p>
         <button type="button" id="font-load">选择字体</button>
         <input type="search" id="font-search" placeholder="搜索字体…" autocomplete="off" hidden />
         <div id="font-list" role="listbox" aria-label="系统字体" hidden></div>
+        <p class="field-label">预览</p>
         <div id="font-preview">DeepSeek Harness 字体预览 0123456789 The quick brown fox</div>
         <div class="font-actions">
           <button type="button" id="font-apply" class="primary">应用字体</button>
         </div>
-      </section>
+      </aside>
     </div>
   </body>
 </html>
