@@ -112,6 +112,22 @@ fn foreign_dialog_lift_plan(
     }
 }
 
+/// The picker is kept above this app only while the user is still in it.
+///
+/// Raising it with `HWND_TOPMOST` makes the shell refuse the taskbar switch:
+/// the other program's button flashes and its window never becomes foreground.
+/// `HWND_TOP` is enough to clear the harness overlay and still lets that switch
+/// succeed. A foreign foreground then places the picker behind the program the
+/// user selected.
+fn picker_stays_above_foreground(
+    foreground_is_picker: bool,
+    foreground_pid: u32,
+    our_pid: u32,
+    foreground_in_dsh_tree: bool,
+) -> bool {
+    foreground_is_picker || (foreground_pid != 0 && foreground_pid == our_pid) || foreground_in_dsh_tree
+}
+
 fn remember_dsh_root_pid(pid: Option<u32>) {
     #[cfg(windows)]
     DSH_ROOT_PID.store(pid.unwrap_or(0), Ordering::SeqCst);
@@ -1891,7 +1907,10 @@ fn lift_foreign_dialog(hwnd: isize) {
     let foreground = unsafe { win32::GetForegroundWindow() } == hwnd;
     let plan = foreign_dialog_lift_plan(already, foreground);
     debug_assert!(!plan.assign_owner && !plan.disable_main);
-    const HWND_TOPMOST: isize = -1;
+    // Insert at the top of the ordinary z-order. The always-on-top value (-1)
+    // makes a taskbar click flash the other program's button instead of
+    // giving it the foreground.
+    const HWND_TOP: isize = 0;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOACTIVATE: u32 = 0x0010;
@@ -1908,7 +1927,7 @@ fn lift_foreign_dialog(hwnd: isize) {
         if !plan.set_foreground {
             flags |= SWP_NOACTIVATE;
         }
-        win32::SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        win32::SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags);
         // Both of these activate a top-level window, so a re-lift restacks and
         // stops there.
         if plan.set_foreground {
@@ -1916,6 +1935,56 @@ fn lift_foreign_dialog(hwnd: isize) {
             win32::SetForegroundWindow(hwnd);
         }
     }
+}
+
+/// Let the program the user just selected cover the folder picker.
+///
+/// `HWND_NOTOPMOST` alone parks the dialog at the top of the ordinary z-order,
+/// which is still in front of the window that was just activated. Place it
+/// behind that window after clearing the topmost style.
+#[cfg(windows)]
+fn release_picker_behind(foreground: isize, picker: isize) {
+    const HWND_NOTOPMOST: isize = -2;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    let flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE;
+    unsafe {
+        win32::SetWindowPos(picker, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+        if foreground != 0 && foreground != picker {
+            win32::SetWindowPos(picker, foreground, 0, 0, 0, 0, flags);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sync_picker_to_foreground(foreground: isize) {
+    let picker = PICKER_HWND.load(Ordering::SeqCst);
+    if picker == 0 {
+        return;
+    }
+    if unsafe { win32::IsWindow(picker) } == 0 {
+        clear_lifted_picker();
+        return;
+    }
+    let foreground_is_picker = foreground == picker;
+    let foreground_pid = if foreground == 0 {
+        0
+    } else {
+        window_pid(foreground)
+    };
+    let ours = unsafe { win32::GetCurrentProcessId() };
+    let in_tree = if foreground_is_picker || foreground_pid == 0 || foreground_pid == ours {
+        false
+    } else {
+        let root = DSH_ROOT_PID.load(Ordering::SeqCst);
+        root != 0 && pid_is_under_root_with(foreground_pid, root, parent_pid)
+    };
+    if picker_stays_above_foreground(foreground_is_picker, foreground_pid, ours, in_tree) {
+        lift_foreign_dialog(picker);
+        return;
+    }
+    release_picker_behind(foreground, picker);
 }
 
 /// Called only for windows the WinEvent hook has just seen appear.
@@ -1970,17 +2039,29 @@ unsafe extern "system" fn on_win_event(
     _time: u32,
 ) {
     const OBJID_WINDOW: i32 = 0;
+    const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
     const EVENT_SYSTEM_DIALOGSTART: u32 = 0x0010;
     const EVENT_OBJECT_DESTROY: u32 = 0x8001;
     const EVENT_OBJECT_SHOW: u32 = 0x8002;
     const EVENT_OBJECT_HIDE: u32 = 0x8003;
+    if event == EVENT_SYSTEM_FOREGROUND {
+        sync_picker_to_foreground(hwnd);
+        return;
+    }
     if id_object != OBJID_WINDOW || hwnd == 0 {
         return;
     }
-    if event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY {
+    // Hide is not close. A folder dialog hides and shows again while Windows
+    // handles a taskbar click; forgetting it here made the next show call
+    // SetForegroundWindow and pull the foreground back, so the other button
+    // only flashed.
+    if event == EVENT_OBJECT_DESTROY {
         if PICKER_HWND.load(Ordering::SeqCst) == hwnd {
             clear_lifted_picker();
         }
+        return;
+    }
+    if event == EVENT_OBJECT_HIDE {
         return;
     }
     if event == EVENT_OBJECT_SHOW || event == EVENT_SYSTEM_DIALOGSTART {
@@ -1992,6 +2073,7 @@ unsafe extern "system" fn on_win_event(
 fn install_dialog_zorder_hook() {
     unsafe {
         win32::SetWinEventHook(0x8001, 0x8003, 0, on_win_event, 0, 0, 0);
+        win32::SetWinEventHook(0x0003, 0x0003, 0, on_win_event, 0, 0, 0);
         win32::SetWinEventHook(0x0010, 0x0010, 0, on_win_event, 0, 0, 0);
     }
 }
@@ -2685,6 +2767,49 @@ mod tests {
         assert!(
             !lost_focus.set_foreground,
             "re-grabbing the foreground is what pulled the caret out of the composer"
+        );
+    }
+
+    #[test]
+    fn picker_drops_topmost_when_the_user_switches_to_another_program() {
+        assert!(picker_stays_above_foreground(true, 9, 1, false));
+        assert!(picker_stays_above_foreground(false, 1, 1, false));
+        assert!(picker_stays_above_foreground(false, 30, 1, true));
+        assert!(
+            !picker_stays_above_foreground(false, 50, 1, false),
+            "a taskbar switch has to be allowed to cover the folder picker"
+        );
+        assert!(!picker_stays_above_foreground(false, 0, 1, false));
+    }
+
+    #[test]
+    fn folder_picker_is_raised_without_the_topmost_style() {
+        let production = include_str!("main.rs").split("mod tests {").next().unwrap();
+        let lift = production
+            .split("fn lift_foreign_dialog(")
+            .nth(1)
+            .unwrap()
+            .split("fn release_picker_behind(")
+            .next()
+            .unwrap();
+        assert!(
+            lift.contains("const HWND_TOP: isize = 0"),
+            "HWND_TOP clears the overlay without blocking taskbar activation"
+        );
+        assert!(
+            !lift.contains("HWND_TOPMOST"),
+            "HWND_TOPMOST makes the shell flash the other taskbar button instead of switching"
+        );
+        let events = production
+            .split("fn on_win_event(")
+            .nth(1)
+            .unwrap()
+            .split("fn install_dialog_zorder_hook(")
+            .next()
+            .unwrap();
+        assert!(
+            !events.contains("EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY"),
+            "hiding the dialog during a taskbar click must not forget it and grab the foreground again"
         );
     }
 
